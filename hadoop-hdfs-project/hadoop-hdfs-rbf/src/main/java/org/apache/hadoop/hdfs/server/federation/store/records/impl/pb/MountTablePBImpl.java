@@ -21,6 +21,7 @@ import java.io.IOException;
 import java.util.LinkedList;
 import java.util.List;
 
+import javax.annotation.Nullable;
 import org.apache.hadoop.fs.StorageType;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProtos.MountTableRecordProto;
@@ -28,11 +29,13 @@ import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProt
 import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProtos.MountTableRecordProto.DestOrder;
 import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProtos.MountTableRecordProtoOrBuilder;
 import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProtos.RemoteLocationProto;
+import org.apache.hadoop.hdfs.federation.protocol.proto.HdfsServerFederationProtos.MigratingMountPointProto;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.QuotaUsageProto;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.StorageTypeQuotaInfosProto;
 import org.apache.hadoop.hdfs.protocol.proto.HdfsProtos.StorageTypeQuotaInfoProto;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.order.DestinationOrder;
 import static org.apache.hadoop.hdfs.server.federation.router.Quota.eachByStorageType;
@@ -330,6 +333,32 @@ public class MountTablePBImpl extends MountTable implements PBRecord {
       }
       QuotaUsageProto quotaUsage = quotaBuilder.build();
       builder.setQuota(quotaUsage);
+    }
+  }
+
+  @Override
+  public MigratingMountPointInfo getMigratingMountPointInfo() {
+    MountTableRecordProtoOrBuilder proto = this.translator.getProtoOrBuilder();
+    if (!proto.hasMigratingMountPoint()) {
+      return null;
+    } else {
+      return new MigratingMountPointInfo(
+          proto.getMigratingMountPoint().getSrcNs(),
+          proto.getMigratingMountPoint().getDstNs());
+    }
+  }
+
+  @Override
+  public void setMigratingMountPointInfo(
+      @Nullable MigratingMountPointInfo migratingMountPointInfo) {
+    Builder builder = this.translator.getBuilder();
+    if (migratingMountPointInfo == null) {
+      builder.clearMigratingMountPoint();
+    } else {
+      builder.setMigratingMountPoint(MigratingMountPointProto.newBuilder()
+          .setSrcNs(migratingMountPointInfo.getSrcNs())
+          .setDstNs(migratingMountPointInfo.getDstNs())
+          .build());
     }
   }
 

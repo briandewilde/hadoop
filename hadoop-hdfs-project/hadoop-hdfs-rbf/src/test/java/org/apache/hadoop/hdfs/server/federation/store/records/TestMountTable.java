@@ -32,6 +32,7 @@ import java.util.List;
 import java.util.Map;
 
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.order.DestinationOrder;
 import org.apache.hadoop.hdfs.server.federation.router.RouterQuotaUsage;
@@ -76,6 +77,9 @@ public class TestMountTable {
   public void testGetterSetter() throws IOException {
 
     MountTable record = MountTable.newInstance(SRC, DST_MAP);
+    MigratingMountPointInfo migratingMountPointInfo =
+        new MigratingMountPointInfo("ns0", "ns1");
+    record.setMigratingMountPointInfo(migratingMountPointInfo);
 
     validateDestinations(record);
     assertEquals(SRC, record.getSourcePath());
@@ -99,6 +103,7 @@ public class TestMountTable {
     assertEquals(DATE_MOD, record2.getDateModified());
     assertFalse(record.isReadOnly());
     assertEquals(DestinationOrder.HASH, record.getDestOrder());
+    assertEquals(migratingMountPointInfo, record.getMigratingMountPointInfo());
   }
 
   @Test
@@ -116,6 +121,9 @@ public class TestMountTable {
     record.setReadOnly(true);
     record.setDestOrder(order);
     record.setQuota(QUOTA);
+    MigratingMountPointInfo migratingMountPointInfo =
+        new MigratingMountPointInfo("ns0", "ns1");
+    record.setMigratingMountPointInfo(migratingMountPointInfo);
 
     StateStoreSerializer serializer = StateStoreSerializer.getSerializer();
     String serializedString = serializer.serializeString(record);
@@ -129,6 +137,7 @@ public class TestMountTable {
     assertEquals(DATE_MOD, record2.getDateModified());
     assertTrue(record2.isReadOnly());
     assertEquals(order, record2.getDestOrder());
+    assertEquals(migratingMountPointInfo, record2.getMigratingMountPointInfo());
 
     RouterQuotaUsage quotaGet = record2.getQuota();
     assertEquals(NS_COUNT, quotaGet.getFileAndDirectoryCount());

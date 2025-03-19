@@ -22,6 +22,7 @@ import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.FEDE
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.DFS_ROUTER_DEFAULT_NAMESERVICE;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -532,6 +533,43 @@ public class TestMountTableResolver {
       assertionThrown = true;
     }
     assertTrue(assertionThrown);
+  }
+  
+  @Test
+  public void testMigrationRefreshEntries() throws IOException {
+    // Verify new entry without migration
+    Map<String, String> map = getMountTableEntry("1", "/");
+    MountTable mountTable1 = MountTable.newInstance("/1", map);
+    mountTable.refreshEntries(Collections.singletonList(mountTable1));
+    assertNull(mountTable.getMountPoint("/1").getMigratingMountPointInfo());
+
+    // Verify existing entry starts migration
+    MountTable mountTable2 = MountTable.newInstance("/1", map);
+    mountTable2.setMigratingMountPointInfo(
+        new MigratingMountPointInfo("1", "2"));
+    mountTable.refreshEntries(Collections.singletonList(mountTable2));
+    assertNotNull(mountTable.getMountPoint("/1").getMigratingMountPointInfo());
+    assertEquals("1",
+        mountTable.getMountPoint("/1").getMigratingMountPointInfo().getSrcNs());
+    assertEquals("2",
+        mountTable.getMountPoint("/1").getMigratingMountPointInfo().getDstNs());
+
+    // Verify existing entry rolls back migration
+    MountTable mountTable3 = MountTable.newInstance("/1", map);
+    mountTable3.setMigratingMountPointInfo(
+        new MigratingMountPointInfo("2", "1"));
+    mountTable.refreshEntries(Collections.singletonList(mountTable3));
+    assertNotNull(mountTable.getMountPoint("/1").getMigratingMountPointInfo());
+    assertEquals("2",
+        mountTable.getMountPoint("/1").getMigratingMountPointInfo().getSrcNs());
+    assertEquals("1",
+        mountTable.getMountPoint("/1").getMigratingMountPointInfo().getDstNs());
+    
+    // Verify existing entry clears migration
+    MountTable mountTable4 = MountTable.newInstance("/1", map);
+    mountTable4.setMigratingMountPointInfo(null);
+    mountTable.refreshEntries(Collections.singletonList(mountTable4));
+    assertNull(mountTable.getMountPoint("/1").getMigratingMountPointInfo());
   }
 
   @Test
