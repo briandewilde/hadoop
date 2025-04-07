@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
 import org.apache.hadoop.thirdparty.com.google.common.base.Preconditions;
 
 import org.apache.hadoop.conf.Configuration;
@@ -284,6 +285,13 @@ public class RouterAdminServer extends AbstractService
   @Override
   public AddMountTableEntryResponse addMountTableEntry(
       AddMountTableEntryRequest request) throws IOException {
+    if (this.router.getSubclusterResolver() instanceof MountTableResolver) {
+      if (MigratingMountTableResolver.isMigrating(request.getEntry(), null)) {
+        request.setEntry(
+            MigratingMountTableResolver.reconcileEntryWithMigration(
+                request.getEntry(), null));
+      }
+    }
     return getMountTableStore().addMountTableEntry(request);
   }
 
@@ -296,6 +304,12 @@ public class RouterAdminServer extends AbstractService
       MountTableResolver mResolver =
           (MountTableResolver) this.router.getSubclusterResolver();
       oldEntry = mResolver.getMountPoint(updateEntry.getSourcePath());
+
+      if (MigratingMountTableResolver.isMigrating(updateEntry, oldEntry)) {
+        request.setEntry(
+            MigratingMountTableResolver.reconcileEntryWithMigration(updateEntry,
+                oldEntry));
+      }
     }
     UpdateMountTableEntryResponse response = getMountTableStore()
         .updateMountTableEntry(request);

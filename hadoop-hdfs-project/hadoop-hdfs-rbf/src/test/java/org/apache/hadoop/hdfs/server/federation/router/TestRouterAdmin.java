@@ -38,6 +38,7 @@ import org.apache.hadoop.hdfs.server.federation.RouterConfigBuilder;
 import org.apache.hadoop.hdfs.server.federation.StateStoreDFSCluster;
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableManager;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.order.DestinationOrder;
@@ -84,7 +85,8 @@ public class TestRouterAdmin {
 
   @BeforeClass
   public static void globalSetUp() throws Exception {
-    cluster = new StateStoreDFSCluster(false, 2);
+    cluster = new StateStoreDFSCluster(false, 2,
+        MigratingMountTableResolver.class);
     // Build and start a router with State Store + admin + RPC
     Configuration conf = new RouterConfigBuilder()
         .stateStore()
@@ -484,21 +486,22 @@ public class TestRouterAdmin {
   
   @Test
   public void testUpdateMigratingMountPoint() throws IOException {
-    MountTable newEntry = MountTable.newInstance(
-        "/testpath", Collections.singletonMap("ns0", "/testdir"),
-        Time.now(), Time.now());
 
     RouterClient client = routerContext.getAdminClient();
     MountTableManager mountTable = client.getMountTableManager();
 
     // Existing mount table size
-    List<MountTable> records = getMountTableEntries(mountTable);
-    assertEquals(records.size(), mockMountTable.size());
+    {
+      List<MountTable> records = getMountTableEntries(mountTable);
+      assertEquals(records.size(), mockMountTable.size());
+    }
 
     // Add mount point
     {
+      MountTable setEntry = MountTable.newInstance("/testpath",
+          Collections.singletonMap("ns0", "/testdir"), Time.now(), Time.now());
       UpdateMountTableEntryRequest updateRequest =
-          UpdateMountTableEntryRequest.newInstance(newEntry);
+          UpdateMountTableEntryRequest.newInstance(setEntry);
       UpdateMountTableEntryResponse updateResponse =
           mountTable.updateMountTableEntry(updateRequest);
       assertTrue(updateResponse.getStatus());
@@ -508,52 +511,153 @@ public class TestRouterAdmin {
     }
 
     // New mount table size
-    List<MountTable> records2 = getMountTableEntries(mountTable);
-    assertEquals(records2.size(), mockMountTable.size() + 1);
+    {
+      List<MountTable> records = getMountTableEntries(mountTable);
+      assertEquals(records.size(), mockMountTable.size() + 1);
+      // Assert that the mount table contains only the source destination
+      MountTable entry = getMountTableEntry("/testpath");
+      assertNotNull(entry);
+      assertEquals(1, entry.getDestinations().size());
+      assertTrue(entry.getDestinations().contains(
+          new RemoteLocation("ns0", "/testdir", "/testpath")));
+    }
     
     // Update migrating mount point
     {
-      newEntry.setMigratingMountPointInfo(new MigratingMountPointInfo(
+      MountTable setEntry = getMountTableEntry("/testpath");
+      assertNotNull(setEntry);
+      setEntry.setMigratingMountPointInfo(new MigratingMountPointInfo(
           "ns0", "ns1"));
       UpdateMountTableEntryRequest updateRequest =
-          UpdateMountTableEntryRequest.newInstance(newEntry);
+          UpdateMountTableEntryRequest.newInstance(setEntry);
       UpdateMountTableEntryResponse updateResponse =
           mountTable.updateMountTableEntry(updateRequest);
       assertTrue(updateResponse.getStatus());
-      MountTable entry = getMountTableEntry("/testpath");
-      assertNotNull(entry);
-      assertNotNull(entry.getMigratingMountPointInfo());
-      assertEquals("ns0", entry.getMigratingMountPointInfo().getSrcNs());
-      assertEquals("ns1", entry.getMigratingMountPointInfo().getDstNs());
+      MountTable checkEntry = getMountTableEntry("/testpath");
+      assertNotNull(checkEntry);
+      assertNotNull(checkEntry.getMigratingMountPointInfo());
+      assertEquals("ns0", checkEntry.getMigratingMountPointInfo().getSrcNs());
+      assertEquals("ns1", checkEntry.getMigratingMountPointInfo().getDstNs());
+      assertEquals(2, checkEntry.getDestinations().size());
+      assertTrue(checkEntry.getDestinations().contains(
+          new RemoteLocation("ns0", "/testdir", "/testpath")));
+      assertTrue(checkEntry.getDestinations().contains(
+          new RemoteLocation("ns1", "/testdir", "/testpath")));
     }
     
     // Roll back migrating mount point
     {
-      newEntry.setMigratingMountPointInfo(new MigratingMountPointInfo(
+      MountTable setEntry = getMountTableEntry("/testpath");
+      assertNotNull(setEntry);
+      setEntry.setMigratingMountPointInfo(new MigratingMountPointInfo(
           "ns1", "ns0"));
       UpdateMountTableEntryRequest updateRequest =
-          UpdateMountTableEntryRequest.newInstance(newEntry);
+          UpdateMountTableEntryRequest.newInstance(setEntry);
       UpdateMountTableEntryResponse updateResponse =
           mountTable.updateMountTableEntry(updateRequest);
       assertTrue(updateResponse.getStatus());
-      MountTable entry = getMountTableEntry("/testpath");
-      assertNotNull(entry);
-      assertNotNull(entry.getMigratingMountPointInfo());
-      assertEquals("ns1", entry.getMigratingMountPointInfo().getSrcNs());
-      assertEquals("ns0", entry.getMigratingMountPointInfo().getDstNs());
+      MountTable checkEntry = getMountTableEntry("/testpath");
+      assertNotNull(checkEntry);
+      assertNotNull(checkEntry.getMigratingMountPointInfo());
+      assertEquals("ns1", checkEntry.getMigratingMountPointInfo().getSrcNs());
+      assertEquals("ns0", checkEntry.getMigratingMountPointInfo().getDstNs());
     }
     
     // Clear migrating mount point
     {
-      newEntry.setMigratingMountPointInfo(null);
+      MountTable setEntry = MountTable.newInstance("/testpath",
+          Collections.singletonMap("ns0", "/testdir"), Time.now(), Time.now());
+      assertNotNull(setEntry);
+      setEntry.setMigratingMountPointInfo(null);
       UpdateMountTableEntryRequest updateRequest =
-          UpdateMountTableEntryRequest.newInstance(newEntry);
+          UpdateMountTableEntryRequest.newInstance(setEntry);
       UpdateMountTableEntryResponse updateResponse =
           mountTable.updateMountTableEntry(updateRequest);
       assertTrue(updateResponse.getStatus());
+      MountTable checkEntry = getMountTableEntry("/testpath");
+      assertNotNull(checkEntry);
+      assertNull(checkEntry.getMigratingMountPointInfo());
+    }
+  }
+
+  @Test
+  public void testMigratingMountPointExitsKeepingSource() throws IOException {
+    RouterClient client = routerContext.getAdminClient();
+    MountTableManager mountTable = client.getMountTableManager();
+
+    testAddMigratingMountPoint();
+
+    // Ensure that the mount table contains the source and destination
+    {
+      MountTable entry = getMountTableEntry("/testpath");
+      assertNotNull(entry);
+      assertNotNull(entry.getMigratingMountPointInfo());
+      assertEquals(2, entry.getDestinations().size());
+      assertTrue(entry.getDestinations().contains(
+          new RemoteLocation("ns0", "/testdir", "/testpath")));
+      assertTrue(entry.getDestinations().contains(
+          new RemoteLocation("ns1", "/testdir", "/testpath")));
+    }
+
+    // Exit keeping source
+    MountTable newEntry = MountTable.newInstance("/testpath",
+        Collections.singletonMap("ns0", "/testdir"), Time.now(), Time.now());
+    newEntry.setMigratingMountPointInfo(null);
+    UpdateMountTableEntryRequest updateRequest =
+        UpdateMountTableEntryRequest.newInstance(newEntry);
+    UpdateMountTableEntryResponse updateResponse =
+        mountTable.updateMountTableEntry(updateRequest);
+    assertTrue(updateResponse.getStatus());
+    
+    // Ensure that the mount table contains only the source
+    {
       MountTable entry = getMountTableEntry("/testpath");
       assertNotNull(entry);
       assertNull(entry.getMigratingMountPointInfo());
+      assertEquals(1, entry.getDestinations().size());
+      assertTrue(entry.getDestinations()
+          .contains(new RemoteLocation("ns0", "/testdir", "/testpath")));
+    }
+  }
+
+  @Test
+  public void testMigratingMountPointExitsKeepingDest() throws IOException {
+    RouterClient client = routerContext.getAdminClient();
+    MountTableManager mountTable = client.getMountTableManager();
+
+    testAddMigratingMountPoint();
+    
+    // Ensure that the mount table contains the source and destination
+    {
+      MountTable entry = getMountTableEntry("/testpath");
+      assertNotNull(entry);
+      assertNotNull(entry.getMigratingMountPointInfo());
+      assertEquals(2, entry.getDestinations().size());
+      assertTrue(entry.getDestinations().contains(
+          new RemoteLocation("ns0", "/testdir", "/testpath")));
+      assertTrue(entry.getDestinations().contains(
+          new RemoteLocation("ns1", "/testdir", "/testpath")));
+    }
+
+    // Exit keeping dest
+    MountTable newEntry = MountTable.newInstance("/testpath",
+        Collections.singletonMap("ns1", "/testdir"), Time.now(), Time.now());
+    newEntry.setMigratingMountPointInfo(null);
+    UpdateMountTableEntryRequest updateRequest =
+        UpdateMountTableEntryRequest.newInstance(newEntry);
+    UpdateMountTableEntryResponse updateResponse =
+        mountTable.updateMountTableEntry(updateRequest);
+    assertTrue(updateResponse.getStatus());
+    
+    // Ensure that the mount table contains only the destination
+    {
+      MountTable entry = getMountTableEntry("/testpath");
+      assertNotNull(entry);
+      assertNull(entry.getMigratingMountPointInfo());
+
+      assertEquals(1, entry.getDestinations().size());
+      assertTrue(entry.getDestinations()
+          .contains(new RemoteLocation("ns1", "/testdir", "/testpath")));
     }
   }
 }
