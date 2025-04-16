@@ -323,4 +323,8 @@ public class RBFConfigKeys extends CommonConfigurationKeysPublic {
   public static final Class<? extends AbstractDelegationTokenSecretManager>
       DFS_ROUTER_DELEGATION_TOKEN_DRIVER_CLASS_DEFAULT =
       ZKDelegationTokenSecretManagerImpl.class;
+
+  // Mount table migration
+  public static final String DFS_ROUTER_MIGRATION_BATCH_SIZE =
+      FEDERATION_ROUTER_PREFIX + "migration.batch.size";
 }

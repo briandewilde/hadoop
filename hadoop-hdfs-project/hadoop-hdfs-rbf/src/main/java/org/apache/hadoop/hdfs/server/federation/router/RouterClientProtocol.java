@@ -80,6 +80,7 @@ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifie
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver.MigrationBehavior;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RouterResolveException;
@@ -237,6 +238,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public LocatedBlocks getBlockLocations(String src, final long offset,
       final long length) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LATEST, src);
 
     List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
@@ -775,6 +777,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public DirectoryListing getListing(String src, byte[] startAfter,
       boolean needLocation) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.UNION, src);
 
     List<RemoteResult<RemoteLocation, DirectoryListing>> listings =
         getListingInt(src, startAfter, needLocation);
@@ -896,6 +899,7 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public HdfsFileStatus getFileInfo(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LATEST, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);

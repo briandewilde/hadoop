@@ -10,4 +10,8 @@ public class IllegalMigrationException extends IOException {
   public IllegalMigrationException(String message) {
     super(message);
   }
+
+  public IllegalMigrationException(String message, Throwable cause) {
+    super(message, cause);
+  }
 }

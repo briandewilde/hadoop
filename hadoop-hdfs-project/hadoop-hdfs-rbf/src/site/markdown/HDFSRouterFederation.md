@@ -308,6 +308,34 @@ A mount point can only migrate to another nameservice, meaning the source namese
 
 Migration only affects the Router's handling of operations, but does not drive the data movement; for that, one should use a tool like `distcp` to copy the data from the source subcluster to the destination subcluster. `distcp` should be started after the migration is started, and should be stopped before the migration is ended.
 
+##### Migration behaviors
+
+The migration behavior should be set for each operation which supports migration in RouterClientProtocol as such:
+```java
+setMigrationBehavior(MigrationBehavior.LATEST, path);
+```
+
+No other logic is needed in the operation path; it is called automatically through the `MigratingMountTableResolver#getDestinationForPath` method.
+
+If there is no migration, this is effectively a no-op. (The call will save that no migration is in progress, so that the behavior is consistent if a migration starts between the call to `setBehavior` and `getDestinationForPath`.)
+
+If there is a migration, the behavior will be set to the specified value. The call to `getDestinationForPath` will implement all of the migration logic and adjust the returned `PathLocation` object to ensure the operation is directed to the correct namenode(s).
+
+If the operation does not call `getDestinationForPath`, the migration behavior is ignored.
+
+If the migration behavior is not specified, it defaults to `MigrationBehavior.UNDEFINED` which causes an exception to be thrown and the operation to fail.
+
+The following migration behaviors are supported:
+* LATEST: The Router will issue the op to whichever subcluster has the latest version of the data, or the destination if both are up to date. Intended for read operations.
+  * The modtime is used to determine the latest. Since directories do not have accurate modtimes, the destination is always preferred.
+  * If a subcluster does not have the file, the other is preferred.
+* UNION: The Router will issue the op to both subclusters. Intended for listing operations.
+* UNDEFINED: The Router will throw an exception and cause the operation to fail.
+
+Note: Migration behaviors such as LATEST will result in multiple calls to the namenodes; e.g. first to determine the latest file, and then to get the file. As a result, the operation may be slower than a normal operation and the operation is no longer atomic. To ensures consistency, the migration context cache saves the migration behavior and references to respective objects (such as `MigratingMountPointInfo`) when the migration behavior is set or the context is first retrieved. This context is recycled for each new operation.
+
+##### Controlling a migration
+
 To start a migration for `/path` from `ns1` to `ns2`, one can use the following command to update the source mount point (`ns1` mounted as `/path`) to migrate to the destination nameservice (`ns2`):
 
     [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path -setMigration ns1 ns2

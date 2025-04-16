@@ -1,28 +1,83 @@
 package org.apache.hadoop.hdfs.server.federation.resolver;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
+import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
+import org.apache.hadoop.hdfs.server.federation.router.RemoteMethod;
+import org.apache.hadoop.hdfs.server.federation.router.RemoteResult;
+import org.apache.hadoop.hdfs.server.federation.router.RouterRpcClient;
+import org.apache.hadoop.hdfs.server.federation.router.RouterRpcServer;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
+import org.apache.hadoop.ipc.RPC;
+import org.apache.hadoop.ipc.Server;
+import org.apache.hadoop.thirdparty.com.google.common.collect.ArrayListMultimap;
+import org.apache.hadoop.thirdparty.com.google.common.collect.Multimap;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import static org.mockito.Mockito.*;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver.MigrationBehavior;
+import org.mockito.ArgumentCaptor;
+import org.mockito.exceptions.base.MockitoException;
+
+
 public class TestMigratingMountTableResolver {
   private static final String path = "/mp0";
   private static MigratingMountTableResolver resolver;
+  private static RouterRpcServer rpcServerMock;
+  private static RouterRpcClient rpcClientMock;
+
+  private final RemoteLocation locationSrc =
+      new RemoteLocation("ns0", path, path);
+  private final RemoteLocation locationDst =
+      new RemoteLocation("ns1", path, path);
+  private final HdfsFileStatus newerFileInfo =
+      mock(HdfsLocatedFileStatus.class);
+  private final HdfsFileStatus olderFileInfo =
+      mock(HdfsLocatedFileStatus.class);
+
+  private static final HdfsFileStatus presentFileInfo =
+      mock(HdfsFileStatus.class);
+  private static final HdfsFileStatus presentDirInfo =
+      mock(HdfsFileStatus.class);
+
+  public TestMigratingMountTableResolver() {
+    when(newerFileInfo.getModificationTime()).thenReturn(2L);
+    when(olderFileInfo.getModificationTime()).thenReturn(1L);
+    when(presentFileInfo.isDirectory()).thenReturn(false);
+    when(presentDirInfo.isDirectory()).thenReturn(true);
+  }
 
   @Before
   public void setup() throws IOException {
     Configuration conf = new Configuration();
     conf.setStrings(DFSConfigKeys.DFS_NAMESERVICES, "ns0", "ns1");
     resolver = new MigratingMountTableResolver(conf, null);
+    rpcServerMock = mock(RouterRpcServer.class);
+    rpcClientMock = mock(RouterRpcClient.class);
+    when(rpcServerMock.getRPCClient()).thenReturn(rpcClientMock);
+    resolver.setRpcServer(rpcServerMock);
 
     setupMountTableEntry();
+  }
+  
+  @After
+  public void resetMocks() throws IOException {
+    resolver.setMigrationBehavior(MigrationBehavior.UNDEFINED, path);
+    // Because this test is not associated with an RPC call all invocations
+    // will share the same (invalid) RPC call id. To better simulate caching,
+    // reset the context between tests.
+    resolver.resetContext();
   }
 
   /**
@@ -273,5 +328,238 @@ public class TestMigratingMountTableResolver {
     Assert.assertTrue(migrationEntry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
+  }
+
+  /**
+   * Test the resolver without a migrating mount point. The resolver should
+   * include both source and dest per the default MountTableResolver behavior,
+   * ignoring the migration behavior.
+   */
+  @Test
+  public void testResolverWithoutMigrationIncludesBoth()
+      throws IOException {
+    setupMountTableEntry("ns0", "ns1");
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, olderFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationSrc, locationDst)
+        .assertNotInvoked(locationSrc, locationDst);
+  }
+
+  @Test
+  public void testLatestBehaviorIncludesLatestSrc() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, olderFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationSrc)
+        .assertExcludes(locationDst)
+        .assertInvoked(locationSrc, locationDst);
+  }
+
+  @Test
+  public void testLatestBehaviorIncludesLatestDst() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper()
+        .addResult(locationSrc, olderFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, newerFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+  }
+  
+  @Test
+  public void testLatestBehaviorDefaultsToDst() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, newerFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+  }
+  
+  @Test
+  public void testLatestBehaviorAlwaysUsesDstDir() throws IOException {
+    when(newerFileInfo.isDirectory()).thenReturn(true);
+    when(olderFileInfo.isDirectory()).thenReturn(true);
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper()
+        // For this test, use the newer modification time for the source
+        // to ensure mod time is not considered for dirs
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, olderFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+  }
+
+  @Test
+  public void testUnionBehaviorIncludesBoth() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.UNION, path);
+    new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, olderFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationSrc, locationDst)
+        .assertNotInvoked(locationSrc, locationDst);
+  }
+  
+  @Test
+  public void testUndefinedBehaviorThrows() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.UNDEFINED, path);
+    IOException e = Assert.assertThrows(IOException.class,
+            () -> new TestHelper().evaluate());
+    Assert.assertTrue(
+        e.getMessage().contains("Operation has no defined migration behavior"));
+  }
+
+  @Test
+  public void testDefaultBehaviorIsUndefinedAndThrows() throws IOException {
+    setupMigratingMountTableEntry();
+    IOException e = Assert.assertThrows(IOException.class,
+        () -> new TestHelper().evaluate());
+    Assert.assertTrue(
+        e.getMessage().contains("Operation has no defined migration behavior"));
+  }
+  
+  @Test
+  public void testDefaultBehaviorResetsToUndefinedAndThrows()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    // Set the RPC call ID to 1 to simulate an RPC call
+    RPC.Server.getCurCall()
+        .set(new Server.Call(1, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
+            "Test".getBytes()));
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    new TestHelper().evaluate();
+    
+    // Set the RPC call ID to 2 to simulate another RPC call on the same thread
+    RPC.Server.getCurCall()
+        .set(new Server.Call(2, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
+            "Test".getBytes()));
+    IOException e = Assert.assertThrows(IOException.class,
+        () -> new TestHelper().evaluate());
+    Assert.assertTrue(
+        e.getMessage().contains("Operation has no defined migration behavior"));
+  }
+
+  @Test
+  public void testOtherPathFetchesRemoteLocationFromResolver()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    // Cache migration behavior and location for path
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    PathLocation pathLocation = resolver.getDestinationForPath(path + "/foo");
+    // Cached location is for path, so assert pathLocation is path + "/foo"
+    Assert.assertEquals(path + "/foo", pathLocation.getSourcePath());
+  }
+  
+  @Test
+  public void testComparingFilesAndDirectoriesFails() throws IOException {
+    setupMigratingMountTableEntry();
+    HdfsFileStatus fileInfo = mock(HdfsFileStatus.class);
+    HdfsFileStatus dirInfo = mock(HdfsFileStatus.class);
+    when(fileInfo.isDirectory()).thenReturn(false);
+    when(dirInfo.isDirectory()).thenReturn(true);
+    resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
+    TestHelper helper = new TestHelper()
+        .addResult(locationSrc, fileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, dirInfo, HdfsFileStatus.class);
+    Assert.assertThrows(IOException.class, helper::evaluate);
+  }
+
+  private static class TestHelper {
+    final Multimap<Class<?>, RemoteResult<RemoteLocation, ?>> resultsMap;
+    final List<RemoteLocation> invokedLocations;
+    PathLocation destination;
+
+    TestHelper() {
+      resultsMap = ArrayListMultimap.create();
+      invokedLocations = new ArrayList<>();
+    }
+
+    <T> TestHelper addResult(RemoteLocation location, T object,
+        Class<T> clazz) {
+      resultsMap.put(clazz, new RemoteResult<>(location, object));
+      return this;
+    }
+    
+    TestHelper evaluate() throws IOException {
+      return evaluate(path);
+    }
+    
+    void injectMocks() throws IOException {
+      // Mock the RPC client to return the results
+      for (Class<?> clazz : resultsMap.keySet()) {
+        List<RemoteResult<RemoteLocation, ?>> results =
+            new ArrayList<>(resultsMap.get(clazz));
+        doReturn(results).when(rpcClientMock)
+            .invokeConcurrent(anyList(), any(RemoteMethod.class), anyBoolean(),
+                anyLong(), eq(clazz));
+      }
+    }
+    
+    TestHelper evaluate(String path) throws IOException {
+      injectMocks();
+
+      // Set up a captor to capture the locations that are invoked
+      @SuppressWarnings("unchecked")
+      ArgumentCaptor<List<RemoteLocation>> captor =
+          ArgumentCaptor.forClass(List.class);
+      try {
+        destination = resolver.getDestinationForPath(path);
+      } finally {
+        // Capture the locations that are invoked regardless of invocations
+        verify(rpcClientMock, atLeast(0)).invokeConcurrent(captor.capture(),
+            any(RemoteMethod.class), anyBoolean(), anyLong(), any());
+        try {
+          invokedLocations.addAll(captor.getValue());
+        } catch (MockitoException e) {
+          // Ignore and default to no invoked locations
+        }
+      }
+      return this;
+    }
+    
+    TestHelper assertIncludes(RemoteLocation... locations) {
+      for (RemoteLocation location : locations) {
+        Assert.assertTrue(destination.getDestinations().contains(location));
+      }
+      return this;
+    }
+    
+    TestHelper assertExcludes(RemoteLocation... locations) {
+      for (RemoteLocation location : locations) {
+        Assert.assertFalse(destination.getDestinations().contains(location));
+      }
+      return this;
+    }
+    
+    TestHelper assertInvoked(RemoteLocation... locations) {
+      for (RemoteLocation location : locations) {
+        Assert.assertTrue(invokedLocations.contains(location));
+      }
+      return this;
+    }
+    
+    TestHelper assertNotInvoked(RemoteLocation... locations) {
+      for (RemoteLocation location : locations) {
+        Assert.assertFalse(invokedLocations.contains(location));
+      }
+      return this;
+    }
   }
 }
