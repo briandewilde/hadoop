@@ -20,6 +20,7 @@ import org.apache.hadoop.hdfs.DistributedFileSystem;
 import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster;
 import org.apache.hadoop.hdfs.server.federation.RouterConfigBuilder;
 import org.apache.hadoop.hdfs.server.federation.StateStoreDFSCluster;
+import org.apache.hadoop.hdfs.server.federation.resolver.IllegalMigrationException;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableManager;
@@ -28,6 +29,7 @@ import org.apache.hadoop.hdfs.server.federation.store.protocol.RemoveMountTableE
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryRequest;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryResponse;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
+import org.apache.hadoop.ipc.RemoteException;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -167,6 +169,22 @@ public class TestRouterRpcMigrationBehavior {
   }
 
   /**
+   * Test a create request should create files on target sub-cluster only with
+   * the migrating mount table resolver.
+   */
+  @Test
+  public void testCreateWritesDestination() throws IOException {
+    setupMountTableForMigration();
+
+    Path filePath = new Path(sourcePath, "file");
+    DFSTestUtil.createFile(routerFs, filePath, 100L, (short) 1,
+        1024L);
+    assertTrue(nnFs1.exists(filePath));
+    assertTrue(routerFs.exists(filePath));
+    assertFalse(nnFs0.exists(filePath));
+  }
+
+  /**
    * Test that get file status (for a directory) reads from the destination
    * namespace, whenever available.
    */
@@ -280,6 +298,59 @@ public class TestRouterRpcMigrationBehavior {
     // Update the mod time on the src file and ensure it is read
     nnFs0.setTimes(path, System.currentTimeMillis(), -1);
     assertEquals(readLine(nnFs0.open(path)), readLine(routerFs.open(path)));
+  }
+
+  @Test
+  public void testCreateFileBeforeMigrationGoesToSrc() throws IOException {
+    setupMountTable();
+    Path path = new Path(sourcePath, "file");
+    String str = "Source file";
+
+    // Create the file before the migration
+    FSDataOutputStream out = routerFs.create(path);
+    // Start migration and then write to the file
+    setupMountTableForMigration();
+    try (BufferedWriter bufferedWriter = new BufferedWriter(
+        new java.io.OutputStreamWriter(out, StandardCharsets.UTF_8))) {
+      bufferedWriter.write(str.split("\n")[0]);
+    }
+
+    // Ensure it was created and written on the source
+    assertTrue(nnFs0.exists(path));
+    assertFalse(nnFs1.exists(path));
+    assertEquals(str, readLine(nnFs0.open(path)));
+  }
+
+  @Test
+  public void testCreateFileDuringMigrationGoesToDst() throws IOException {
+    setupMountTableForMigration();
+    Path path = new Path(sourcePath, "file");
+    String str = "Destination file";
+
+    // Write the file during the migration
+    writeLine(routerFs.create(path), str);
+
+    // Ensure it was created and written on the destination
+    assertTrue(nnFs1.exists(path));
+    assertFalse(nnFs0.exists(path));
+    assertEquals(str, readLine(nnFs1.open(path)));
+  }
+  
+  @Test
+  public void testCreateFilePresentOnSrcThrows() throws IOException {
+    setupMountTableForMigration();
+    Path path = new Path(sourcePath, "file");
+
+    // Create the file on src
+    writeLine(nnFs0.create(path), "Source file");
+
+    // Assert that the file is not on the dst
+    assertFalse(nnFs1.exists(path));
+
+    // Try to create the same file on dst and ensure it throws an exception
+    RemoteException e = assertThrows(RemoteException.class, () -> 
+      writeLine(routerFs.create(path), "Destination file"));
+    assertEquals(IllegalMigrationException.class.getName(), e.getClassName());
   }
 
   /**

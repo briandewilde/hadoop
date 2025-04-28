@@ -271,6 +271,7 @@ public class RouterClientProtocol implements ClientProtocol {
       String storagePolicy)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     if (createParent && rpcServer.isPathAll(src)) {
       int index = src.lastIndexOf(Path.SEPARATOR);
@@ -377,6 +378,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public LastBlockWithStatus append(String src, final String clientName,
       final EnumSetWritable<CreateFlag> flag) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     List<RemoteLocation> locations = rpcServer.getLocationsForPath(src, true);
     RemoteMethod method = new RemoteMethod("append",
@@ -474,6 +476,7 @@ public class RouterClientProtocol implements ClientProtocol {
       String[] favoredNodes, EnumSet<AddBlockFlag> addBlockFlags)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("addBlock",
         new Class<?>[] {String.class, String.class, ExtendedBlock.class,
@@ -504,6 +507,7 @@ public class RouterClientProtocol implements ClientProtocol {
       final int numAdditionalNodes, final String clientName)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("getAdditionalDatanode",
         new Class<?>[] {String.class, long.class, ExtendedBlock.class,
@@ -538,6 +542,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public boolean complete(String src, String clientName, ExtendedBlock last,
       long fileId) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("complete",
         new Class<?>[] {String.class, String.class, ExtendedBlock.class,
@@ -725,6 +730,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public boolean mkdirs(String src, FsPermission masked, boolean createParent)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false);
@@ -1251,6 +1257,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public void fsync(String src, long fileId, String clientName,
       long lastBlockLength) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, true, false);

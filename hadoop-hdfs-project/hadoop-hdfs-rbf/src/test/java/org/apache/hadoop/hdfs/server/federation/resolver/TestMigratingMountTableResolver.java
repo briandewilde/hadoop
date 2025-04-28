@@ -11,6 +11,7 @@ import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteMethod;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteResult;
 import org.apache.hadoop.hdfs.server.federation.router.RouterRpcClient;
@@ -405,6 +406,150 @@ public class TestMigratingMountTableResolver {
   }
 
   @Test
+  public void testDstOnlyBehaviorExcludesSrc() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.DST_ONLY, path);
+    new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, newerFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+  }
+  
+  @Test
+  public void testDstOnlyBehaviorThrowsForOutOfDateDst() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.DST_ONLY, path);
+    TestHelper helper = new TestHelper()
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, olderFileInfo, HdfsFileStatus.class);
+    Assert.assertThrows(IOException.class, helper::evaluate);
+    helper.assertInvoked(locationSrc, locationDst);
+  }
+  
+  @Test
+  public void testLeasedBehaviorIncludesLeasedSrc() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksLeased = mock(LocatedBlocks.class);
+    LocatedBlocks blocksOther = mock(LocatedBlocks.class);
+    when(blocksLeased.isUnderConstruction()).thenReturn(true);
+    when(blocksOther.isUnderConstruction()).thenReturn(false);
+
+    new TestHelper()
+        .addResult(locationSrc, blocksLeased, LocatedBlocks.class)
+        .addResult(locationDst, blocksOther, LocatedBlocks.class)
+        .evaluate()
+        .assertIncludes(locationSrc)
+        .assertExcludes(locationDst)
+        .assertInvoked(locationSrc, locationDst);
+  }
+
+  @Test
+  public void testLeasedBehaviorIncludesLeasedDst() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksLeased = mock(LocatedBlocks.class);
+    LocatedBlocks blocksOther = mock(LocatedBlocks.class);
+    when(blocksLeased.isUnderConstruction()).thenReturn(true);
+    when(blocksOther.isUnderConstruction()).thenReturn(false);
+
+    new TestHelper()
+        .addResult(locationSrc, blocksOther, LocatedBlocks.class)
+        .addResult(locationDst, blocksLeased, LocatedBlocks.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+  }
+
+  @Test
+  public void testLeasedBehaviorDefaultsToDst() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksLeased = mock(LocatedBlocks.class);
+    LocatedBlocks blocksOther = mock(LocatedBlocks.class);
+    when(blocksLeased.isUnderConstruction()).thenReturn(false);
+    when(blocksOther.isUnderConstruction()).thenReturn(false);
+
+    new TestHelper()
+        .addResult(locationSrc, blocksOther, LocatedBlocks.class)
+        .addResult(locationDst, blocksLeased, LocatedBlocks.class)
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, newerFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+
+    verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
+        any(RemoteMethod.class), anyBoolean(), anyLong(),
+        eq(LocatedBlocks.class));
+    verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
+        any(RemoteMethod.class), anyBoolean(), anyLong(),
+        eq(HdfsFileStatus.class));
+  }
+
+  @Test
+  public void testLeasedBehaviorHandlesMissingSrcBlocks()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksExist = mock(LocatedBlocks.class);
+    when(blocksExist.isUnderConstruction()).thenReturn(false);
+
+    // If source blocks are missing, the resolver should treat them as
+    // non-leased. The destination is also non-leased, so this should default to
+    // the destination.
+    new TestHelper()
+        .addResult(locationSrc, null, LocatedBlocks.class)
+        .addResult(locationDst, blocksExist, LocatedBlocks.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc);
+  }
+  
+  @Test
+  public void testLeasedBehaviorHandlesMissingDstBlocks()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksExist = mock(LocatedBlocks.class);
+    when(blocksExist.isUnderConstruction()).thenReturn(false);
+
+    // If destination blocks are missing, the resolver should treat them as
+    // non-leased. The source is also non-leased, so this should default to
+    // the destination.
+    new TestHelper()
+        .addResult(locationSrc, blocksExist, LocatedBlocks.class)
+        .addResult(locationDst, null, LocatedBlocks.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc);
+  }
+
+  @Test
+  public void testLeasedBehaviorHandlesMissingSrcAndDstBlocks()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+
+    // If source and destination blocks are missing, the resolver should treat
+    // them both as non-leased and default to the destination.
+    new TestHelper()
+        .addResult(locationSrc, null, LocatedBlocks.class)
+        .addResult(locationDst, null, LocatedBlocks.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc);
+  }
+  
+  @Test
   public void testUnionBehaviorIncludesBoth() throws IOException {
     setupMigratingMountTableEntry();
     resolver.setMigrationBehavior(MigrationBehavior.UNION, path);
@@ -481,6 +626,59 @@ public class TestMigratingMountTableResolver {
     Assert.assertThrows(IOException.class, helper::evaluate);
   }
 
+  /**
+   * This is a special test to ensure that if a migrating mount point changes
+   * during an operation, in this case a LEASED operation (which involves
+   * multiple calls to NNs), the resolver will use the saved context to
+   * determine the behavior.
+   * @throws IOException If there is an error.
+   */
+  @Test
+  public void testMigrationUsesSavedContextWithinOp() throws IOException {
+    setupMigratingMountTableEntry();
+    resolver.setMigrationBehavior(MigrationBehavior.LEASED, path);
+    LocatedBlocks blocksLeased = mock(LocatedBlocks.class);
+    LocatedBlocks blocksOther = mock(LocatedBlocks.class);
+    when(blocksLeased.isUnderConstruction()).thenReturn(false);
+    when(blocksOther.isUnderConstruction()).thenReturn(false);
+
+    TestHelper helper = new TestHelper() {
+      @Override
+      void injectMocks() throws IOException {
+        // Mock the RPC client to return the results
+        for (Class<?> clazz : resultsMap.keySet()) {
+          List<RemoteResult<RemoteLocation, ?>> results =
+              new ArrayList<>(resultsMap.get(clazz));
+          doAnswer(i -> {
+            if (LocatedBlocks.class.isAssignableFrom(clazz)) {
+              // Change so that the mount table is no longer migrating
+              setupMountTableEntry();
+            }
+            return results;
+          }).when(rpcClientMock)
+              .invokeConcurrent(anyList(), any(RemoteMethod.class),
+                  anyBoolean(), anyLong(), eq(clazz));
+        }
+      }
+    };
+    helper
+        .addResult(locationSrc, blocksOther, LocatedBlocks.class)
+        .addResult(locationDst, blocksLeased, LocatedBlocks.class)
+        .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
+        .addResult(locationDst, newerFileInfo, HdfsFileStatus.class)
+        .evaluate()
+        .assertIncludes(locationDst)
+        .assertExcludes(locationSrc)
+        .assertInvoked(locationSrc, locationDst);
+
+    verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
+        any(RemoteMethod.class), anyBoolean(), anyLong(),
+        eq(LocatedBlocks.class));
+    verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
+        any(RemoteMethod.class), anyBoolean(), anyLong(),
+        eq(HdfsFileStatus.class));
+  }
+  
   private static class TestHelper {
     final Multimap<Class<?>, RemoteResult<RemoteLocation, ?>> resultsMap;
     final List<RemoteLocation> invokedLocations;

@@ -18,6 +18,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
+import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteMethod;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteParam;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteResult;
@@ -106,7 +107,11 @@ public class MigratingMountTableResolver extends MountTableResolver {
    */
   public enum MigrationBehavior {
     /**
-     * Consider both the source and destination for metadata-only operations.
+     * Only allow the operation on the destination mount point
+     */
+    DST_ONLY,
+    /**
+     * Consider both the source and destination for metadata-only operations
      */
     UNION,
     /**
@@ -116,7 +121,17 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     LATEST,
     /**
-     * Migration behavior is not defined; operations will fail unless set.
+     * Allow the operation on the source or destination with the lease.
+     * This is needed because in-flight writes to the source may call operations
+     * (e.g. addBlock) that must be sent to the source even when mod times are
+     * equal; however during migration, data pipeline operations (e.g. addBlock)
+     * are generally sent to the destination. This can be replaced to LATEST if
+     * all in-flight writes to the source are completed before files are copied
+     * to the destination.
+     */
+    LEASED,
+    /**
+     * Migration behavior is not defined; operations will fail unless set
      */
     UNDEFINED
   }
@@ -144,7 +159,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
       @Nullable String path)
       throws IOException {
     if (rpcClient == null || rpcServer == null) {
-      throw new RuntimeException("MigratingMountTableResolver not initialized");
+      throw new IllegalMigrationException(
+          "MigratingMountTableResolver not initialized");
     } else {
       // Use the migrating mount point info saved to the context cache
       MigratingMountPointInfo migratingMountPointInfo =
@@ -373,12 +389,20 @@ public class MigratingMountTableResolver extends MountTableResolver {
       List<RemoteLocation> targetLocations;
       MigrationBehavior migrationBehavior = context.getMigrationBehavior(path);
       switch (migrationBehavior) {
+        case DST_ONLY:
+          targetLocations = Collections.singletonList(
+              getDestinationLocation(remoteLocations));
+          break;
         case UNION:
           targetLocations = remoteLocations.asList();
           break;
         case LATEST:
           targetLocations = Collections.singletonList(
               getComparatorLocation(latestComparator, remoteLocations));
+          break;
+        case LEASED:
+          targetLocations = Collections.singletonList(
+              getLeasedLocation(remoteLocations));
           break;
         case UNDEFINED:
           // Cause new operations to fail until the migration behavior is set
@@ -490,14 +514,89 @@ public class MigratingMountTableResolver extends MountTableResolver {
         return locations.getSrc();
       }
     } catch (IllegalArgumentException e) {
-      throw new IllegalMigrationException(String.format("Cannot compare file to"
-          + " directory; path %s, call id %s", locations.getPath(),
-          RPC.Server.getCallId()), e);
+      throw new IllegalMigrationException(
+          String.format("Cannot compare file to directory; path %s, call id %s",
+              locations.getPath(), RPC.Server.getCallId()), e);
     }
   }
 
   /**
-   * Invokes getFileInfo for multiple locations, bypassing router logic.
+   * Get the destination location, ensuring that the destination is not
+   * out-of-date
+   * Note: Files copied to the destination while in-flight writes occur to
+   * source may be out-of-date and cannot accept DST_ONLY operations without
+   * potential data-loss. Directories are metadata-only therefore unaffected.
+   * @param locations The remote locations as a pair
+   * @return The destination location
+   * @throws IOException If an error occurs while retrieving file information or
+   *                     the destination is out-of-date
+   */
+  private RemoteLocation getDestinationLocation(
+      MigrationPair<RemoteLocation> locations) throws IOException {
+    Map<RemoteLocation, HdfsFileStatus> fileInfo =
+        getFileInfo(locations.asList());
+    HdfsFileStatus srcFileInfo = fileInfo.get(locations.getSrc());
+    HdfsFileStatus dstFileInfo = fileInfo.get(locations.getDst());
+
+    // Return dst location if src modtime is less than or equal to dst modtime
+    try {
+      if (latestComparator.compare(srcFileInfo, dstFileInfo) <= 0) {
+        return locations.getDst();
+      } else {
+        throw new IllegalMigrationException(
+            String.format("Destination is not up-to-date; path %s, call id %s",
+                locations.getPath(), RPC.Server.getCallId()));
+      }
+    } catch (IllegalArgumentException e) {
+      throw new IllegalMigrationException(
+          String.format("Cannot compare file to directory; path %s, call id %s",
+              locations.getPath(), RPC.Server.getCallId()), e);
+    }
+  }
+
+  /**
+   * Get the location with a lease, else the dst if no lease is active
+   * @param locations The remote locations as a pair
+   * @return The location with a lease, else the dst if no lease is active
+   * @throws IOException If an error occurs while retrieving file information or
+   * there is more than once lease
+   */
+  private RemoteLocation getLeasedLocation(
+      MigrationPair<RemoteLocation> locations) throws IOException {
+    Map<RemoteLocation, LocatedBlocks> blockLocations = getBlockLocations(
+        locations.asList());
+    // If either source or destination blocks is null, it is not leased
+    LocatedBlocks srcBlocks =
+        blockLocations.getOrDefault(locations.getSrc(), new LocatedBlocks());
+    boolean srcLeased = srcBlocks != null && srcBlocks.isUnderConstruction();
+    LocatedBlocks dstBlocks =
+        blockLocations.getOrDefault(locations.getDst(), new LocatedBlocks());
+    boolean dstLeased = dstBlocks != null && dstBlocks.isUnderConstruction();
+    if (srcLeased && dstLeased) {
+      // The lease should never be open on the source and destination
+      // simultaneously; if it does happen, fail the operation to bubble the
+      // error to the client, which is preferable to allowing two different
+      // writes to the source and destination (which could result in data loss
+      // or corruption).
+      throw new IllegalMigrationException(
+          String.format("Both source and destination are leased; path %s,"
+              + " call id %s", locations.getPath(), RPC.Server.getCallId()));
+    } else if (srcLeased) {
+      return locations.getSrc();
+    } else if (dstLeased) {
+      return locations.getDst();
+    } else {
+      // Since leases are used for writes, the absence of a lease should also
+      // be treated as a write operation, therefore use destination location.
+      LOG.debug(
+          "Neither source or destination is leased, so using destination;"
+          + " path {} call id {}", locations.getPath(), RPC.Server.getCallId());
+      return getDestinationLocation(locations);
+    }
+  }
+
+  /**
+   * Invokes getFileInfo for multiple locations, bypassing migration logic.
    * Uses max batch size to avoid excessive fan-out.
    * @param locations The locations from which file status should be retrieved
    * @return A map of the locations and their corresponding file status
@@ -509,6 +608,22 @@ public class MigratingMountTableResolver extends MountTableResolver {
         new RemoteMethod("getFileInfo", new Class<?>[]{String.class},
             new RemoteParam());
     return invokeBatched(locations, method, HdfsFileStatus.class,
+        batchSize, BatchHandling.CONTINUE);
+  }
+
+  /**
+   * Invokes getBlockLocations for multiple locations, bypassing migration
+   * logic.
+   * @param locations The locations from which file status should be retrieved
+   * @return A map of the locations and their corresponding block locations
+   * @throws IOException If an error occurs while retrieving block locations
+   */
+  private Map<RemoteLocation, LocatedBlocks> getBlockLocations(
+      Collection<RemoteLocation> locations) throws IOException {
+    RemoteMethod method = new RemoteMethod("getBlockLocations",
+        new Class<?>[]{String.class, long.class, long.class}, new RemoteParam(),
+        0, Long.MAX_VALUE);
+    return invokeBatched(locations, method, LocatedBlocks.class,
         batchSize, BatchHandling.CONTINUE);
   }
 
@@ -533,7 +648,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
 
   /**
    * Invokes rpcClient methods for multiple locations in batches to control
-   * fan-out, bypassing router logic.
+   * fan-out, bypassing migration logic.
    * @param locations The locations to which the methods should be invoked
    * @param maxBatchSize The maximum number of methods to invoke at once
    *                     (0 for unlimited, 1 for sequential)
