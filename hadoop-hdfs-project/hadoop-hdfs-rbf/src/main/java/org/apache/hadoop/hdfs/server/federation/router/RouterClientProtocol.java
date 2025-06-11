@@ -378,7 +378,6 @@ public class RouterClientProtocol implements ClientProtocol {
   public LastBlockWithStatus append(String src, final String clientName,
       final EnumSetWritable<CreateFlag> flag) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
-    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     List<RemoteLocation> locations = rpcServer.getLocationsForPath(src, true);
     RemoteMethod method = new RemoteMethod("append",

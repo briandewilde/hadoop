@@ -1,6 +1,13 @@
 package org.apache.hadoop.hdfs.server.federation.resolver;
 
+import java.util.LinkedList;
+import java.util.Objects;
+import java.util.UUID;
+import java.util.function.Function;
+import org.apache.commons.io.FilenameUtils;
 import org.apache.commons.lang3.tuple.Pair;
+import org.apache.hadoop.fs.FileAlreadyExistsException;
+import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -8,6 +15,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -17,6 +25,10 @@ import java.util.Set;
 import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.XAttr;
+import org.apache.hadoop.fs.XAttrSetFlag;
+import org.apache.hadoop.fs.permission.AclStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteMethod;
@@ -51,8 +63,18 @@ public class MigratingMountTableResolver extends MountTableResolver {
   private final MigrationContextCache context;
 
   /**
-   * A default batch size of 2 avoids excessive fan-out but still allows source
-   * and destination block locations to be fetched concurrently.
+   * An instance of a helper class to assist with copying missing parents.
+   */
+  private final MissingPathHandler missingPathHandler;
+
+  /**
+   * The temporary staging location used to create missing directories.
+   */
+  private final String tempStagingSubdir;
+
+  /**
+   * The number of destination block locations that can be batched currently,
+   * allowing to throttle latency vs fanout.
    */
   private final int batchSize;
 
@@ -87,8 +109,21 @@ public class MigratingMountTableResolver extends MountTableResolver {
   public MigratingMountTableResolver(Configuration conf, Router routerService) {
     super(conf, routerService);
 
-    nameServices.addAll(conf.getTrimmedStringCollection(DFS_NAMESERVICES));
+    tempStagingSubdir = conf.get(DFS_ROUTER_MIGRATION_TEMP_STAGING_SUBDIR,
+        DFS_ROUTER_MIGRATION_TEMP_STAGING_SUBDIR_DEFAULT);
+    /*
+     * Latency of ops during migration will increase, however a minimum batch
+     * size of two should cause latency to not more than double without causing
+     * excessive fan-out, except for create ops. A batch size of three allows
+     * latency to not more than double for create ops, unless there are missing
+     * parent directories.
+     */
     batchSize = conf.getInt(DFS_ROUTER_MIGRATION_BATCH_SIZE, 2);
+    LOG.debug("Using migration batch size {}", batchSize);
+
+    missingPathHandler = new MissingPathHandler();
+
+    nameServices.addAll(conf.getTrimmedStringCollection(DFS_NAMESERVICES));
     context = new MigrationContextCache();
   }
 
@@ -103,25 +138,34 @@ public class MigratingMountTableResolver extends MountTableResolver {
   }
 
   /**
-   * Set the behavior of the current operation during mount point migration.
+   * Set the RPC client for the resolver. This is intended strictly for testing.
+   * @param rpcClient The RPC client to be used by the resolver
+   */
+  @VisibleForTesting
+  public void setRpcClient(RouterRpcClient rpcClient) {
+    this.rpcClient = rpcClient;
+  }
+
+  /**
+   * The defined behavior of the current operation during mount point migration.
    */
   public enum MigrationBehavior {
     /**
-     * Only allow the operation on the destination mount point
-     */
-    DST_ONLY,
-    /**
-     * Consider both the source and destination for metadata-only operations
+     * Use locations on both the source and destination for metadata-only
+     * operations. Intended for list operations.
      */
     UNION,
     /**
-     * Allow the operation on the source or destination with the latest mod
-     * time, or the destination if the mod times are equal; for directories, the
-     * destination used whenever it exists.
+     * Use locations on either the source or destination, whichever has the
+     * latest mod time, or else the destination for directories or if mod times
+     * are equal. Intended for reads.
      */
     LATEST,
     /**
-     * Allow the operation on the source or destination with the lease.
+     * Use locations on either the source or destination, whichever has an
+     * active lease, or else the destination for directories or if if there is
+     * no active lease. Intended for write data pipeline operations.
+     * <p>
      * This is needed because in-flight writes to the source may call operations
      * (e.g. addBlock) that must be sent to the source even when mod times are
      * equal; however during migration, data pipeline operations (e.g. addBlock)
@@ -131,7 +175,21 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     LEASED,
     /**
-     * Migration behavior is not defined; operations will fail unless set
+     * Use the destination location only. Intended for create, mkdirs, and
+     * internal calls.
+     * <p>
+     * Since some directories may not yet be copied to the destination and this
+     * does not otherwise check path presence or mod times, this checks for
+     * directories that exist on the source but not the destination and copies
+     * them.
+     */
+    DST_ONLY,
+    /**
+     * Use the source location only. Intended for internal calls.
+     */
+    SRC_ONLY,
+    /**
+     * Migration behavior is not defined; operations will fail unless set.
      */
     UNDEFINED
   }
@@ -156,13 +214,14 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * @throws IOException If an error occurs
    */
   public void setMigrationBehavior(MigrationBehavior migrationBehavior,
-      @Nullable String path)
-      throws IOException {
+      String path) throws IOException {
     if (rpcClient == null || rpcServer == null) {
       throw new IllegalMigrationException(
           "MigratingMountTableResolver not initialized");
-    } else {
-      // Use the migrating mount point info saved to the context cache
+    }
+    // If the context is not yet set, then the op is sourced from the client;
+    // save the migration context and use the specified migration behavior.
+    if (!context.isSet()) {
       MigratingMountPointInfo migratingMountPointInfo =
           context.set(migrationBehavior, path).getMigratingMountPointInfo();
       if (migratingMountPointInfo != null) {
@@ -170,7 +229,24 @@ public class MigratingMountTableResolver extends MountTableResolver {
         LOG.info("Using migration behavior {} ({}->{}) on {}; call id {}",
             migrationBehavior, migratingMountPointInfo.getSrcNs(),
             migratingMountPointInfo.getDstNs(), path, RPC.Server.getCallId());
+        // Only DST_ONLY ops may encounter missing directories, as they do not
+        // check latest
+        if (migrationBehavior == MigrationBehavior.DST_ONLY) {
+          // Since the context is not already set, it is safe to create missing
+          // paths here; otherwise assume missing paths are already created
+          MigrationPairList<RemoteLocation> missingPaths =
+              missingPathHandler.getMissingParentPaths(new Path(path));
+          if (!missingPaths.isEmpty()) {
+            missingPathHandler.copyMissingPathsFromSrc(missingPaths);
+          }
+        }
       }
+    } else {
+      // If the context already is set, this method is being invoked for an op
+      // that is internal to migration; use the saved behavior and ignore the
+      // migration behavior specified as a param.
+      LOG.debug("Migration behavior is already set to {} on {}; call id {}",
+          context.getMigrationBehavior(path), path, RPC.Server.getCallId());
     }
   }
 
@@ -389,9 +465,16 @@ public class MigratingMountTableResolver extends MountTableResolver {
       List<RemoteLocation> targetLocations;
       MigrationBehavior migrationBehavior = context.getMigrationBehavior(path);
       switch (migrationBehavior) {
+        case SRC_ONLY:
+          targetLocations =
+              Collections.singletonList(remoteLocations.getSrc());
+          break;
         case DST_ONLY:
-          targetLocations = Collections.singletonList(
-              getDestinationLocation(remoteLocations));
+          // A check whether the path exists on the source subcluster has
+          // already been performed as part of the missing paths check;
+          // see pathPresenceCache#getMissingParentDirectories.
+          targetLocations =
+              Collections.singletonList(remoteLocations.getDst());
           break;
         case UNION:
           targetLocations = remoteLocations.asList();
@@ -516,41 +599,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
     } catch (IllegalArgumentException e) {
       throw new IllegalMigrationException(
           String.format("Cannot compare file to directory; path %s, call id %s",
-              locations.getPath(), RPC.Server.getCallId()), e);
-    }
-  }
-
-  /**
-   * Get the destination location, ensuring that the destination is not
-   * out-of-date
-   * Note: Files copied to the destination while in-flight writes occur to
-   * source may be out-of-date and cannot accept DST_ONLY operations without
-   * potential data-loss. Directories are metadata-only therefore unaffected.
-   * @param locations The remote locations as a pair
-   * @return The destination location
-   * @throws IOException If an error occurs while retrieving file information or
-   *                     the destination is out-of-date
-   */
-  private RemoteLocation getDestinationLocation(
-      MigrationPair<RemoteLocation> locations) throws IOException {
-    Map<RemoteLocation, HdfsFileStatus> fileInfo =
-        getFileInfo(locations.asList());
-    HdfsFileStatus srcFileInfo = fileInfo.get(locations.getSrc());
-    HdfsFileStatus dstFileInfo = fileInfo.get(locations.getDst());
-
-    // Return dst location if src modtime is less than or equal to dst modtime
-    try {
-      if (latestComparator.compare(srcFileInfo, dstFileInfo) <= 0) {
-        return locations.getDst();
-      } else {
-        throw new IllegalMigrationException(
-            String.format("Destination is not up-to-date; path %s, call id %s",
-                locations.getPath(), RPC.Server.getCallId()));
-      }
-    } catch (IllegalArgumentException e) {
-      throw new IllegalMigrationException(
-          String.format("Cannot compare file to directory; path %s, call id %s",
-              locations.getPath(), RPC.Server.getCallId()), e);
+              locations.getPath(RemoteLocation::getSrc),
+              RPC.Server.getCallId()), e);
     }
   }
 
@@ -580,7 +630,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // or corruption).
       throw new IllegalMigrationException(
           String.format("Both source and destination are leased; path %s,"
-              + " call id %s", locations.getPath(), RPC.Server.getCallId()));
+              + " call id %s", locations.getPath(RemoteLocation::getSrc),
+              RPC.Server.getCallId()));
     } else if (srcLeased) {
       return locations.getSrc();
     } else if (dstLeased) {
@@ -590,8 +641,197 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // be treated as a write operation, therefore use destination location.
       LOG.debug(
           "Neither source or destination is leased, so using destination;"
-          + " path {} call id {}", locations.getPath(), RPC.Server.getCallId());
-      return getDestinationLocation(locations);
+          + " path {} call id {}", locations.getPath(RemoteLocation::getSrc),
+          RPC.Server.getCallId());
+      return locations.getDst();
+    }
+  }
+
+  /**
+   * A class to identify and copy paths that are present on the source but
+   * missing on the destination.
+   */
+  private class MissingPathHandler {
+    /**
+     * Get the missing parent directories for the given path.
+     * @param path The path for which to get the missing parent directories.
+     * @return A list of remote locations that are missing on the destination
+     * @throws IOException If an error occurs while checking the file status
+     */
+    private MigrationPairList<RemoteLocation> getMissingParentPaths(
+        Path path) throws IOException {
+      String sourcePath = getPathLocation(path.toUri().getPath())
+          .getSourcePath();
+
+      // Build a list of all possible paths
+      MigrationPairList<RemoteLocation> locations = new MigrationPairList<>();
+      for (Path p = path; p != null; p = p.getParent()) {
+        String pathStr = p.toUri().getPath();
+        if (pathStr.startsWith(sourcePath) && !pathStr.equals(sourcePath)) {
+          locations.addFirst(getRemoteLocations(pathStr));
+        } else {
+          // Stop if the path is not valid
+          break;
+        }
+      }
+
+      // There is nothing to do if there are no locations under migration
+      if (locations.isEmpty()) {
+        return MigrationPairList.empty();
+      }
+
+      // Fail if the source file already exists
+      MigrationPair<RemoteLocation> pathLocations = locations.removeLast();
+      Map<RemoteLocation, HdfsFileStatus> pathResults =
+          getFileInfo(Collections.singletonList(pathLocations.getSrc()));
+      if (pathResults.get(pathLocations.getSrc()) != null) {
+        // Throw an error if the source file already exists
+        throw new IllegalMigrationException(
+            String.format("Path %s is present on the source, so cannot be "
+                    + "recreated on dst; call id %s", pathLocations.getSrc(),
+                RPC.Server.getCallId()));
+      }
+
+      // Identify which source locations are present, short-circuiting on the
+      // first batch with a missing path
+      Map<RemoteLocation, HdfsFileStatus> existingSrcLocations =
+          getFileInfoShort(locations.getSrcList());
+
+      // Identify which destination locations are present, short-circuiting on the
+      // first batch with a missing path
+      Map<RemoteLocation, HdfsFileStatus> existingDstLocations =
+          getFileInfoShort(locations.getDstList());
+
+      // Identify locations present on the source and missing on the destination
+      MigrationPairList<RemoteLocation> missingLocations =
+          new MigrationPairList<>();
+      for (MigrationPair<RemoteLocation> location : locations) {
+        RemoteLocation srcLocation = location.getSrc();
+        RemoteLocation dstLocation = location.getDst();
+
+        if (existingSrcLocations.get(srcLocation) != null
+            && existingDstLocations.get(dstLocation) == null) {
+          missingLocations.add(location);
+        }
+      }
+
+      return missingLocations;
+    }
+
+    /**
+     * Copy all missing directories from the source to the destination.
+     * @param missingPaths The list of missing paths to copy
+     * @throws IOException If an error occurs while copying the directories
+     */
+    private void copyMissingPathsFromSrc(
+        MigrationPairList<RemoteLocation> missingPaths) throws IOException {
+      // The original path is the last path in the list of missing paths
+      String path = missingPaths.getLast().getPath(RemoteLocation::getSrc);
+      // The mount point root is saved as the path location's source path
+      String mpRoot = getPathLocation(path).getSourcePath();
+      // Use the destination location in the prefix for the missing paths
+      Path prefix = new Path(getMountPointTempPrefix(new Path(mpRoot)),
+          UUID.randomUUID().toString());
+      Map<RemoteLocation, AclStatus> aclStatusMap =
+          getAclStatuses(missingPaths.getSrcList());
+      // Copy all missing directories to the destination
+      for (RemoteLocation location : missingPaths.getSrcList()) {
+        copyDirectory(prefix, location.getSrc(), aclStatusMap.get(location));
+      }
+      // Commit all missing directories to the final location on the
+      // destination, starting with the highest missing path
+      commitDirectories(prefix, missingPaths);
+      cleanupTmpDirectories(prefix);
+    }
+
+    /**
+     * Copy a directory from source to destination, including all metadata.
+     * @param prefix The prefix for the temporary directories
+     * @param srcPath The source path to copy
+     * @param aclStatus The ACL status of the source path
+     * @throws IOException If an error occurs while copying the directory
+     */
+    private void copyDirectory(Path prefix, String srcPath, AclStatus aclStatus)
+        throws IOException {
+      String dstPath = getTmpPath(prefix, srcPath);
+      LOG.info("Copying {} to {}; call id {}", srcPath, dstPath,
+          RPC.Server.getCallId());
+      // Missing parents should be created in the tmp directory to allow missing
+      // dirs to be created at any level, not just root. This requires directory
+      // creation to be in order from parent to child.
+      callNamenode(MigrationBehavior.DST_ONLY,
+          () -> rpcServer.mkdirs(dstPath, aclStatus.getPermission(), true));
+      callNamenode(MigrationBehavior.DST_ONLY,
+          () -> rpcServer.setOwner(dstPath, aclStatus.getOwner(),
+              aclStatus.getGroup()));
+      callNamenode(MigrationBehavior.DST_ONLY,
+          () -> rpcServer.setAcl(dstPath, aclStatus.getEntries()));
+      // setAcl does not set the sticky bit, so we need to do it separately
+      if (aclStatus.isStickyBit()) {
+        callNamenode(MigrationBehavior.DST_ONLY,
+            () -> rpcServer.setPermission(dstPath, aclStatus.getPermission()));
+      }
+      // Copying XAttrs is slow, but in most cases there should be few or none
+      for (XAttr xAttr : callNamenode(MigrationBehavior.SRC_ONLY,
+          () -> rpcServer.listXAttrs(srcPath))) {
+        callNamenode(MigrationBehavior.DST_ONLY,
+            () -> rpcServer.setXAttr(dstPath, xAttr,
+                EnumSet.allOf(XAttrSetFlag.class)));
+      }
+      // Do not copy quotas, as they are not copied by DistCp
+      // Do not copy times, as setTimes only supports files
+    }
+    
+    /**
+     * Commit the directories to the destination, including all metadata.
+     * @param prefix The prefix for the temporary directories
+     * @param missingPaths The list of missing paths to commit
+     * @throws IOException If an error occurs while committing the directories
+     */
+    private void commitDirectories(Path prefix,
+        MigrationPairList<RemoteLocation> missingPaths) throws IOException {
+      // Rename the directories to the final location
+      for (RemoteLocation dstLocation : missingPaths.getDstList()) {
+        String dstPath = dstLocation.getSrc();
+        String srcPath = getTmpPath(prefix, dstPath);
+        LOG.info("Renaming {} to {}; call id {}", srcPath, dstPath,
+            RPC.Server.getCallId());
+        try {
+          callNamenode(MigrationBehavior.DST_ONLY,
+              () -> rpcServer.rename2(srcPath, dstPath, Options.Rename.NONE));
+          // Once the rename succeeds, short-circuit the rename of all children
+          break;
+        } catch (FileAlreadyExistsException e) {
+          // If the rename fails because the directory already exists, then it
+          // may have been copied by distcp; try again for each child
+          LOG.info("Rename not needed for {}; call id {}", dstPath,
+              RPC.Server.getCallId());
+        }
+      }
+    }
+
+    /**
+     * Cleanup the temporary directories created for the migration.
+     * @param prefix The prefix for the temporary directories
+     * @throws IOException If an error occurs while cleaning up the directories
+     */
+    private void cleanupTmpDirectories(Path prefix) throws IOException {
+      // Remove the temporary directories created for the migration
+      callNamenode(MigrationBehavior.DST_ONLY,
+          () -> rpcServer.delete(prefix.toUri().getPath(), true));
+    }
+
+    /**
+     * Get the temporary path for the given path, used to atomically copy
+     * directories.
+     * @param prefix The op-specific prefix for temporary directories
+     * @param path The path to get the temporary path for
+     * @return The temporary path for the given path
+     */
+    private String getTmpPath(Path prefix, String path) {
+      // This uses filename utils to remove the leading slash
+      return new Path(prefix, new Path(FilenameUtils.getPath(path),
+          FilenameUtils.getName(path))).toUri().getPath();
     }
   }
 
@@ -607,8 +847,25 @@ public class MigratingMountTableResolver extends MountTableResolver {
     RemoteMethod method =
         new RemoteMethod("getFileInfo", new Class<?>[]{String.class},
             new RemoteParam());
-    return invokeBatched(locations, method, HdfsFileStatus.class,
-        batchSize, BatchHandling.CONTINUE);
+    return invokeBatched(locations, method, HdfsFileStatus.class, batchSize,
+        false);
+  }
+
+  /**
+   * Invokes getFileInfo for multiple locations, bypassing router logic.
+   * This method short-circuits on exceptions or null results to avoid
+   * unnecessary calls.
+   * @param locations The locations from which file status should be retrieved
+   * @return A map of the locations and their corresponding file status
+   * @throws IOException If an error occurs while retrieving file status
+   */
+  private Map<RemoteLocation, HdfsFileStatus> getFileInfoShort(
+      Collection<RemoteLocation> locations) throws IOException {
+    RemoteMethod method =
+        new RemoteMethod("getFileInfo", new Class<?>[]{String.class},
+            new RemoteParam());
+    return invokeBatched(locations, method, HdfsFileStatus.class, batchSize,
+        true);
   }
 
   /**
@@ -623,27 +880,22 @@ public class MigratingMountTableResolver extends MountTableResolver {
     RemoteMethod method = new RemoteMethod("getBlockLocations",
         new Class<?>[]{String.class, long.class, long.class}, new RemoteParam(),
         0, Long.MAX_VALUE);
-    return invokeBatched(locations, method, LocatedBlocks.class,
-        batchSize, BatchHandling.CONTINUE);
+    return invokeBatched(locations, method, LocatedBlocks.class, batchSize,
+        false);
   }
 
   /**
-   * Enum for handling exceptions in batched invocations.
+   * Invokes getAclStatus for multiple locations, bypassing router logic.
+   * Uses max batch size to avoid excessive fan-out.
+   * @param locations The locations from which ACL status should be retrieved
+   * @return A map of the locations and their corresponding AclStatus
+   * @throws IOException If an error occurs while retrieving AclStatus
    */
-  private enum BatchHandling {
-    /**
-     * Immediately return results if an exception occurs on any invocation
-     */
-    SHORT_CIRCUIT,
-    /**
-     * Throw an exception if an exception occurs on any invocation
-     */
-    THROW,
-    /**
-     * Continue processing if an exception occurs on a batch, only throwing an
-     * exception if all calls fail (similar to RouterRpcClient#invokeConcurrent)
-     */
-    CONTINUE
+  private Map<RemoteLocation, AclStatus> getAclStatuses(
+      Collection<RemoteLocation> locations) throws IOException {
+    RemoteMethod method = new RemoteMethod(
+        "getAclStatus", new Class<?>[]{String.class}, new RemoteParam());
+    return invokeBatched(locations, method, AclStatus.class, batchSize, false);
   }
 
   /**
@@ -652,15 +904,14 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * @param locations The locations to which the methods should be invoked
    * @param maxBatchSize The maximum number of methods to invoke at once
    *                     (0 for unlimited, 1 for sequential)
-   * @param exceptionHandling The handling of exceptions in batched invocations
+   * @param doShortCircuit True to short-circuit if any result is null
    * @return A map of the locations and the results of the methods
-   * @throws IOException If all calls in a batch throw an exception; enabling
+   * @throws IOException If all calls in a batch throw an exception, enabling
    *                     short-circuit logic in case of repeated failures
    */
   private <T> Map<RemoteLocation, T> invokeBatched(
       Collection<RemoteLocation> locations, RemoteMethod method, Class<T> clazz,
-      int maxBatchSize, BatchHandling exceptionHandling)
-      throws IOException {
+      int maxBatchSize, boolean doShortCircuit) throws IOException {
     Map<RemoteLocation, T> results = new HashMap<>();
     IOException lastException = null;
     for (Iterator<RemoteLocation> iter = locations.iterator();
@@ -672,27 +923,28 @@ public class MigratingMountTableResolver extends MountTableResolver {
       }
       List<RemoteResult<RemoteLocation, T>> batchResults =
           rpcClient.invokeConcurrent(batch, method, false, -1, clazz);
+      // Tracks whether a short-circuit is in progress
+      boolean isShortCircuiting = false;
       for (RemoteResult<RemoteLocation, T> result : batchResults) {
+        // Run validation function if present
         if (result.hasException()) {
-          if (exceptionHandling == BatchHandling.THROW) {
-            throw result.getException();
-          }
           lastException = result.getException();
         } else if (result.hasResult()) {
           results.put(result.getLocation(), result.getResult());
+          // If any result is null, short-circuit remaining batches
+          if (doShortCircuit && result.getResult() == null) {
+            isShortCircuiting = true;
+          }
         }
       }
-      if (lastException != null) {
-        if (exceptionHandling == BatchHandling.SHORT_CIRCUIT) {
-          // Assign null values for unmapped keys
-          for (RemoteLocation location : locations) {
-            results.putIfAbsent(location, null);
-          }
-          return results;
-        } else {
-          LOG.warn("Potentially ignoring batched exception; call id {}",
-              RPC.Server.getCallId(), lastException);
+      if (isShortCircuiting) {
+        LOG.debug("Short-circuiting batch due to no non-null responses; "
+            + " call id {}", RPC.Server.getCallId());
+        // Assign null values for unmapped keys
+        for (RemoteLocation location : locations) {
+          results.putIfAbsent(location, null);
         }
+        break;
       }
     }
     // Throw the last exception if present and no results were returned
@@ -702,12 +954,90 @@ public class MigratingMountTableResolver extends MountTableResolver {
     return results;
   }
 
+  @FunctionalInterface
+  private interface RemoteMethodSupplier<T> {
+    T get() throws IOException;
+  }
+
+  /**
+   * Call the namenode directly, bypassing migration logic.
+   * @param overrideBehavior The behavior specifying the target namenode
+   * @param supplier A supplier of the method to be invoked
+   * @return The result of the supplier
+   * @throws IOException If an error occurs while invoking the supplier
+   */
+  private <T> T callNamenode(MigrationBehavior overrideBehavior,
+      RemoteMethodSupplier<T> supplier) throws IOException {
+    return context.overrideBehavior(overrideBehavior, supplier);
+  }
+
+  @FunctionalInterface
+  private interface RemoteMethodRunnable {
+    void run() throws IOException;
+  }
+
+  /**
+   * Call the namenode directly, bypassing migration logic.
+   * @param overrideBehavior The behavior specifying the target namenode
+   * @param runnable A runnable supplying the void method to be invoked
+   * @throws IOException If an error occurs while invoking the runnable
+   */
+  private void callNamenode(MigrationBehavior overrideBehavior,
+      RemoteMethodRunnable runnable) throws IOException {
+    callNamenode(overrideBehavior, () -> {
+      runnable.run();
+      return null; // void return type
+    });
+  }
+
   /**
    * Reset the migration context, used for testing.
    */
   @VisibleForTesting
   void resetContext() {
     context.reset();
+  }
+
+  /**
+   * Get the temporary prefix for the mount point, used for migration.
+   * @param sourcePath The source path for the mount point
+   * @return The temporary prefix for the mount point
+   */
+  public Path getMountPointTempPrefix(Path sourcePath) {
+    return new Path(sourcePath, tempStagingSubdir);
+  }
+
+  private static class MigrationPairList<T>
+      extends LinkedList<MigrationPair<T>> {
+    private static final MigrationPairList<?> EMPTY_LIST =
+        new MigrationPairList<>(Collections.emptyList());
+    
+    @SuppressWarnings("unchecked")
+    public static <M> MigrationPairList<M> empty() {
+      return (MigrationPairList<M>) EMPTY_LIST;
+    }
+    
+    public MigrationPairList() {
+      super();
+    }
+
+    public MigrationPairList(List<MigrationPair<T>> pairs) {
+      super(pairs);
+    }
+    
+    public List<T> getSrcList() {
+      return this.stream()
+          .map(MigrationPair::getSrc)
+          .filter(Objects::nonNull)
+          .collect(Collectors.toList());
+    }
+
+    public List<T> getDstList() {
+      return this.stream()
+          .map(MigrationPair::getDst)
+          .filter(Objects::nonNull)
+          .collect(Collectors.toList());
+    }
   }
 
   /**
@@ -735,15 +1065,25 @@ public class MigratingMountTableResolver extends MountTableResolver {
       return dst;
     }
 
+    /**
+     * Get the source and destination as a list.
+     * @return A list containing the source and destination
+     */
     public List<T> asList() {
       return Arrays.asList(src, dst);
     }
-    
-    public String getPath() {
+
+    /**
+     * Get the path for the source or destination, whichever is non-null,
+     * using the provided function to convert the object to a path.
+     * @param toPath Function to convert the object to a path
+     * @return The path for the source or destination, or null if both are null
+     */
+    public String getPath(Function<T, String> toPath) {
       if (src != null) {
-        return src.toString();
+        return toPath.apply(src);
       } else if (dst != null) {
-        return dst.toString();
+        return toPath.apply(dst);
       } else {
         return null;
       }
@@ -773,6 +1113,15 @@ public class MigratingMountTableResolver extends MountTableResolver {
   private class MigrationContextCache {
     private final ThreadLocal<Pair<Integer, MigrationContextEntry>> cache =
         ThreadLocal.withInitial(() -> null);
+
+    /**
+     * Check if the current operation's migration context is set.
+     * @return True if the context is set, false otherwise
+     */
+    public boolean isSet() {
+      Pair<Integer, MigrationContextEntry> pair = cache.get();
+      return pair != null && pair.getKey() == RPC.Server.getCallId();
+    }
 
     /**
      * Set the current operation's migration behavior and save the context.
@@ -805,11 +1154,26 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return The migration context for the current operation
      * @throws IOException If an error occurs
      */
-    private MigrationContextEntry get(String path) throws IOException {
+    private MigrationContextEntry getOrSet(String path) throws IOException {
       Pair<Integer, MigrationContextEntry> pair = cache.get();
       // Reset the context if it is not set or was set for an old operation
       if (pair == null || pair.getKey() != RPC.Server.getCallId()) {
         return set(MigrationBehavior.UNDEFINED, path);
+      } else {
+        return pair.getValue();
+      }
+    }
+
+    /**
+     * Get the current operation's migration context. If the context is not
+     * set for the current operation, this returns null and does NOT set it.
+     * @return The migration context for the current operation
+     */
+    private MigrationContextEntry get() {
+      Pair<Integer, MigrationContextEntry> pair = cache.get();
+      // Reset the context if it is not set or was set for an old operation
+      if (pair == null || pair.getKey() != RPC.Server.getCallId()) {
+        return null;
       } else {
         return pair.getValue();
       }
@@ -824,7 +1188,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     public MigrationBehavior getMigrationBehavior(String path)
         throws IOException {
-      return get(path).getMigrationBehavior();
+      return getOrSet(path).getMigrationBehavior();
     }
 
     /**
@@ -836,7 +1200,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */ 
     public MigratingMountPointInfo getMigratingMountPointInfo(String path)
         throws IOException {
-      return get(path).getMigratingMountPointInfo();
+      return getOrSet(path).getMigratingMountPointInfo();
     }
 
     /**
@@ -849,12 +1213,36 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return The corresponding PathLocation, or null if not set
      */ 
     public PathLocation getRemoteLocations(String path) throws IOException {
-      PathLocation defaultLocation = get(path).getDefaultLocation();
+      PathLocation defaultLocation = getOrSet(path).getDefaultLocation();
       if (defaultLocation != null && defaultLocation.getSourcePath() != null
-          && defaultLocation.getSourcePath().equals(path)) {
+          && defaultLocation.getDefaultLocation().getSrc().equals(path)) {
         return defaultLocation;
       } else {
         return null;
+      }
+    }
+
+    /**
+     * Override the migration behavior while running the provided supplier.
+     * @param overrideBehavior The migration behavior to use
+     * @param supplier The supplier to run with the overridden behavior
+     * @return The result of the supplier
+     * @param <T> The type of the result returned by the supplier
+     * @throws IOException If an error occurs while running the supplier
+     */
+    public <T> T overrideBehavior(MigrationBehavior overrideBehavior,
+        RemoteMethodSupplier<T> supplier) throws IOException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry == null) {
+        throw new IllegalMigrationException(
+            String.format("Migration context is not set; call id %s",
+            RPC.Server.getCallId()));
+      }
+      try {
+        contextEntry.setOverrideBehavior(overrideBehavior);
+        return supplier.get();
+      } finally {
+        contextEntry.resetOverrideBehavior();
       }
     }
 
@@ -866,6 +1254,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       private final MigrationBehavior migrationBehavior;
       private final MigratingMountPointInfo migratingMountPointInfo;
       private final PathLocation defaultLocation;
+      private MigrationBehavior overrideBehavior;
 
       public MigrationContextEntry(MigrationBehavior migrationBehavior,
           String path) throws IOException {
@@ -875,9 +1264,14 @@ public class MigratingMountTableResolver extends MountTableResolver {
                 : getMountPoint(path).getMigratingMountPointInfo();
         this.defaultLocation = path == null ? null
             : MigratingMountTableResolver.super.getDestinationForPath(path);
+        // By default, the override behavior is undefined
+        this.overrideBehavior = MigrationBehavior.UNDEFINED;
       }
 
       public MigrationBehavior getMigrationBehavior() {
+        if (overrideBehavior != MigrationBehavior.UNDEFINED) {
+          return overrideBehavior;
+        }
         return migrationBehavior;
       }
       
@@ -887,6 +1281,14 @@ public class MigratingMountTableResolver extends MountTableResolver {
       
       public PathLocation getDefaultLocation() {
         return defaultLocation;
+      }
+      
+      private void setOverrideBehavior(MigrationBehavior overrideBehavior) {
+        this.overrideBehavior = overrideBehavior;
+      }
+      
+      private void resetOverrideBehavior() {
+        this.overrideBehavior = MigrationBehavior.UNDEFINED;
       }
     }
   }

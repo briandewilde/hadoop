@@ -537,8 +537,7 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
    */
   public void setMigrationBehavior(
       MigratingMountTableResolver.MigrationBehavior migrationBehavior,
-      String path)
-      throws IOException {
+      String path) throws IOException {
     // Only set the migration behavior if migration is supported, else no-op
     if (subclusterResolver instanceof MigratingMountTableResolver) {
       ((MigratingMountTableResolver) subclusterResolver).setMigrationBehavior(
