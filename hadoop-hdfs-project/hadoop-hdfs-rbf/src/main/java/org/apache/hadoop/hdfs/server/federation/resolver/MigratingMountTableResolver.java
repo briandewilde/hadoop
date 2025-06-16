@@ -228,7 +228,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         // Record the mount point migration and behavior
         LOG.info("Using migration behavior {} ({}->{}) on {}; call id {}",
             migrationBehavior, migratingMountPointInfo.getSrcNs(),
-            migratingMountPointInfo.getDstNs(), path, RPC.Server.getCallId());
+            migratingMountPointInfo.getDstNs(), path, getUUID());
         // Only DST_ONLY ops may encounter missing directories, as they do not
         // check latest
         if (migrationBehavior == MigrationBehavior.DST_ONLY) {
@@ -246,7 +246,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // that is internal to migration; use the saved behavior and ignore the
       // migration behavior specified as a param.
       LOG.debug("Migration behavior is already set to {} on {}; call id {}",
-          context.getMigrationBehavior(path), path, RPC.Server.getCallId());
+          context.getMigrationBehavior(path), path, getUUID());
     }
   }
 
@@ -490,17 +490,17 @@ public class MigratingMountTableResolver extends MountTableResolver {
         case UNDEFINED:
           // Cause new operations to fail until the migration behavior is set
           throw new IOException(String.format("Operation has no defined"
-              + " migration behavior; call id %s", RPC.Server.getCallId()));
+              + " migration behavior; call id %s", getUUID()));
         default:
           // Cause new migration behaviors to fail until defined
           throw new UnsupportedOperationException(String.format(
               "Migration behavior %s is not defined; call id %s",
-              migrationBehavior, RPC.Server.getCallId()));
+              migrationBehavior, getUUID()));
       }
       LOG.debug("Using {} migration destinations; call id {}",
           targetLocations.stream()
               .map(RemoteLocation::getNameserviceId)
-              .collect(Collectors.joining(", ")), RPC.Server.getCallId());
+              .collect(Collectors.joining(", ")), getUUID());
       return new PathLocation(path, targetLocations);
     }
   }
@@ -534,11 +534,11 @@ public class MigratingMountTableResolver extends MountTableResolver {
     if (srcLocation == null) {
       throw new IllegalMigrationException(String.format("Migrating mount point"
           + " does not have a valid source; path %s, call id %s", path,
-          RPC.Server.getCallId()));
+          getUUID()));
     } else if (dstLocation == null) {
       throw new IllegalMigrationException(String.format("Migrating mount point"
           + " does not have a valid destination; path %s, call id %s", path,
-          RPC.Server.getCallId()));
+          getUUID()));
     }
     return MigrationPair.of(srcLocation, dstLocation);
   }
@@ -566,7 +566,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // This can occur if an operation tries to get path locations for a
       // different path (e.g. parent); it is not an error, but a cache miss.
       LOG.warn("Path {} is not in the migration context; call id {}",
-          path, RPC.Server.getCallId());
+          path, getUUID());
       return super.getDestinationForPath(path);
     } else {
       return defaultLocation;
@@ -599,8 +599,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
     } catch (IllegalArgumentException e) {
       throw new IllegalMigrationException(
           String.format("Cannot compare file to directory; path %s, call id %s",
-              locations.getPath(RemoteLocation::getSrc),
-              RPC.Server.getCallId()), e);
+              locations.getPath(RemoteLocation::getSrc), getUUID()), e);
     }
   }
 
@@ -631,7 +630,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       throw new IllegalMigrationException(
           String.format("Both source and destination are leased; path %s,"
               + " call id %s", locations.getPath(RemoteLocation::getSrc),
-              RPC.Server.getCallId()));
+              getUUID()));
     } else if (srcLeased) {
       return locations.getSrc();
     } else if (dstLeased) {
@@ -642,7 +641,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       LOG.debug(
           "Neither source or destination is leased, so using destination;"
           + " path {} call id {}", locations.getPath(RemoteLocation::getSrc),
-          RPC.Server.getCallId());
+          getUUID());
       return locations.getDst();
     }
   }
@@ -689,7 +688,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         throw new IllegalMigrationException(
             String.format("Path %s is present on the source, so cannot be "
                     + "recreated on dst; call id %s", pathLocations.getSrc(),
-                RPC.Server.getCallId()));
+                getUUID()));
       }
 
       // Identify which source locations are present, short-circuiting on the
@@ -754,8 +753,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
     private void copyDirectory(Path prefix, String srcPath, AclStatus aclStatus)
         throws IOException {
       String dstPath = getTmpPath(prefix, srcPath);
-      LOG.info("Copying {} to {}; call id {}", srcPath, dstPath,
-          RPC.Server.getCallId());
+      LOG.info("Copying {} to {}; call id {}", srcPath, dstPath, getUUID());
       // Missing parents should be created in the tmp directory to allow missing
       // dirs to be created at any level, not just root. This requires directory
       // creation to be in order from parent to child.
@@ -794,8 +792,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       for (RemoteLocation dstLocation : missingPaths.getDstList()) {
         String dstPath = dstLocation.getSrc();
         String srcPath = getTmpPath(prefix, dstPath);
-        LOG.info("Renaming {} to {}; call id {}", srcPath, dstPath,
-            RPC.Server.getCallId());
+        LOG.info("Renaming {} to {}; call id {}", srcPath, dstPath, getUUID());
         try {
           callNamenode(MigrationBehavior.DST_ONLY,
               () -> rpcServer.rename2(srcPath, dstPath, Options.Rename.NONE));
@@ -804,8 +801,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         } catch (FileAlreadyExistsException e) {
           // If the rename fails because the directory already exists, then it
           // may have been copied by distcp; try again for each child
-          LOG.info("Rename not needed for {}; call id {}", dstPath,
-              RPC.Server.getCallId());
+          LOG.info("Rename not needed for {}; call id {}", dstPath, getUUID());
         }
       }
     }
@@ -939,7 +935,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       }
       if (isShortCircuiting) {
         LOG.debug("Short-circuiting batch due to no non-null responses; "
-            + " call id {}", RPC.Server.getCallId());
+            + " call id {}", getUUID());
         // Assign null values for unmapped keys
         for (RemoteLocation location : locations) {
           results.putIfAbsent(location, null);
@@ -1005,6 +1001,18 @@ public class MigratingMountTableResolver extends MountTableResolver {
    */
   public Path getMountPointTempPrefix(Path sourcePath) {
     return new Path(sourcePath, tempStagingSubdir);
+  }
+
+  /**
+   * Build a UUID from the current call. At present, this builds a UUID from:
+   *  - The call timestamp, ensuring that sequential calls always have a UUID
+   *  - The call id, ensuring that calls with the same timestamp have a UUID
+   * @return A UUID based on the current RPC call
+   */
+  @VisibleForTesting
+  UUID getUUID() {
+    return new UUID(RPC.Server.getCallId(),
+        RPC.Server.getCurCall().get().getTimestampNanos());
   }
 
   private static class MigrationPairList<T>
@@ -1111,7 +1119,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * the context is used for the remainder of the operation.
    */
   private class MigrationContextCache {
-    private final ThreadLocal<Pair<Integer, MigrationContextEntry>> cache =
+    private final ThreadLocal<Pair<UUID, MigrationContextEntry>> cache =
         ThreadLocal.withInitial(() -> null);
 
     /**
@@ -1119,8 +1127,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return True if the context is set, false otherwise
      */
     public boolean isSet() {
-      Pair<Integer, MigrationContextEntry> pair = cache.get();
-      return pair != null && pair.getKey() == RPC.Server.getCallId();
+      Pair<UUID, MigrationContextEntry> pair = cache.get();
+      return pair != null && pair.getKey().equals(getUUID());
     }
 
     /**
@@ -1134,7 +1142,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         String path) throws IOException {
       MigrationContextEntry
           value = new MigrationContextEntry(migrationBehavior, path);
-      cache.set(Pair.of(RPC.Server.getCallId(), value));
+      cache.set(Pair.of(getUUID(), value));
       return value;
     }
 
@@ -1155,9 +1163,9 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @throws IOException If an error occurs
      */
     private MigrationContextEntry getOrSet(String path) throws IOException {
-      Pair<Integer, MigrationContextEntry> pair = cache.get();
+      Pair<UUID, MigrationContextEntry> pair = cache.get();
       // Reset the context if it is not set or was set for an old operation
-      if (pair == null || pair.getKey() != RPC.Server.getCallId()) {
+      if (pair == null || !pair.getKey().equals(getUUID())) {
         return set(MigrationBehavior.UNDEFINED, path);
       } else {
         return pair.getValue();
@@ -1170,9 +1178,9 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return The migration context for the current operation
      */
     private MigrationContextEntry get() {
-      Pair<Integer, MigrationContextEntry> pair = cache.get();
+      Pair<UUID, MigrationContextEntry> pair = cache.get();
       // Reset the context if it is not set or was set for an old operation
-      if (pair == null || pair.getKey() != RPC.Server.getCallId()) {
+      if (pair == null || !pair.getKey().equals(getUUID())) {
         return null;
       } else {
         return pair.getValue();
@@ -1236,7 +1244,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       if (contextEntry == null) {
         throw new IllegalMigrationException(
             String.format("Migration context is not set; call id %s",
-            RPC.Server.getCallId()));
+                getUUID()));
       }
       try {
         contextEntry.setOverrideBehavior(overrideBehavior);

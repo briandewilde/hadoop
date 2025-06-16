@@ -75,6 +75,10 @@ public class TestMigratingMountTableResolver {
     rpcClientMock = mock(RouterRpcClient.class);
     when(rpcServerMock.getRPCClient()).thenReturn(rpcClientMock);
     resolver.setRpcServer(rpcServerMock);
+    // Set the RPC call ID to 1 to simulate an RPC call
+    RPC.Server.getCurCall()
+        .set(new Server.Call(1, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
+            "Test".getBytes()));
 
     setupMountTableEntry();
   }
@@ -736,10 +740,6 @@ public class TestMigratingMountTableResolver {
   public void testDefaultBehaviorResetsToUndefinedAndThrows()
     throws IOException {
     setupMigratingMountTableEntry();
-    // Set the RPC call ID to 1 to simulate an RPC call
-    RPC.Server.getCurCall()
-        .set(new Server.Call(1, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
-            "Test".getBytes()));
     resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
     new TestHelper().evaluate();
 
@@ -863,6 +863,39 @@ public class TestMigratingMountTableResolver {
     verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
         any(RemoteMethod.class), anyBoolean(), anyLong(),
         eq(LocatedBlocks.class));
+  }
+
+  /**
+   * This is a special test to ensure that if the same call id is used on the
+   * same thread, but as part of a different call, the resolver will not reuse
+   * the saved context.
+   * @throws IOException If there is an error.
+   */
+  @Test
+  public void testMigrationUsesNewContextForSameThreadAndCallId()
+      throws IOException {
+    setupMigratingMountTableEntry();
+    // Set up the initial callId and context
+    RPC.Server.getCurCall()
+        .set(new Server.Call(1, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
+            "Test".getBytes()));
+    resolver.setMigrationBehavior(MigrationBehavior.UNION, path);
+    // Ensure that the resolver returns both src and dst for UNION
+    Assert.assertEquals(2,
+        resolver.getDestinationForPath(path).getDestinations().size());
+    // Ensure that the resolver continues to return both for the same call
+    Assert.assertEquals(2,
+        resolver.getDestinationForPath(path).getDestinations().size());
+
+    // Set up a call with the same callId (and same thread), but ensure the
+    // migration context is not reused (defaults to UNDEFINED)
+    RPC.Server.getCurCall()
+        .set(new Server.Call(1, 1, null, null, RPC.RpcKind.RPC_PROTOCOL_BUFFER,
+            "Test".getBytes()));
+    IOException e = Assert.assertThrows(IOException.class,
+        () -> resolver.getDestinationForPath(path).getDestinations().size());
+    Assert.assertTrue(
+        e.getMessage().contains("Operation has no defined migration behavior"));
   }
   
   private static class TestHelper {
