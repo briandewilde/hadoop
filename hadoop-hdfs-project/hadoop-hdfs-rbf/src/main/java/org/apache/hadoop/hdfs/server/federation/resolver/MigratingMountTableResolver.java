@@ -679,16 +679,20 @@ public class MigratingMountTableResolver extends MountTableResolver {
         return MigrationPairList.empty();
       }
 
-      // Fail if the source file already exists
-      MigrationPair<RemoteLocation> pathLocations = locations.removeLast();
+      // If the source path is missing, skip it and only consider parents;
+      // else if the source path is a file, fail if it exists;
+      // else if the source path is a dir, consider it missing alongside parents
+      MigrationPair<RemoteLocation> pathLocations = locations.peekLast();
       Map<RemoteLocation, HdfsFileStatus> pathResults =
           getFileInfo(Collections.singletonList(pathLocations.getSrc()));
-      if (pathResults.get(pathLocations.getSrc()) != null) {
+      if (pathResults.get(pathLocations.getSrc()) == null) {
+        locations.removeLast();
+      } else if (!pathResults.get(pathLocations.getSrc()).isDirectory()) {
         // Throw an error if the source file already exists
-        throw new IllegalMigrationException(
-            String.format("Path %s is present on the source, so cannot be "
-                    + "recreated on dst; call id %s", pathLocations.getSrc(),
-                getUUID()));
+        throw new IllegalMigrationException(String.format(
+            "Path %s is present on the source, so cannot be "
+                + "recreated on dst; call id %s", pathLocations.getSrc(),
+            getUUID()));
       }
 
       // Identify which source locations are present, short-circuiting on the

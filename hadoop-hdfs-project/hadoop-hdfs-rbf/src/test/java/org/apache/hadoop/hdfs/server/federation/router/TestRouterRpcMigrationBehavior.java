@@ -535,6 +535,40 @@ public class TestRouterRpcMigrationBehavior {
       writeLine(routerFs.create(path), "Destination file"));
     assertEquals(IllegalMigrationException.class.getName(), e.getClassName());
   }
+  
+  @Test
+  public void testMkdirsDirPresentOnSrc() throws IOException {
+    setupMountTableForMigration();
+    Path path = new Path(sourcePath, "file");
+
+    FsPermission unusualPermission = FsPermission.valueOf("-r---w---x")
+        .applyUMask(FsPermission.getUMask(routerContext.getConf()));
+
+    // Assert the unusual permissions are not the default; if the dir default
+    // changes so that ths fails, the unusual permissions must also change
+    assertNotEquals(FsPermission.getDirDefault().applyUMask(
+        FsPermission.getUMask(routerContext.getConf())), unusualPermission);
+
+    // Create dir on src using unusual permissions
+    assertTrue(nnFs0.mkdirs(path, unusualPermission));
+
+    // Create dir on src again using default permission
+    assertTrue(nnFs0.mkdirs(path));
+
+    // Assert that the dir on the src kept the unusual permissions
+    assertEquals(unusualPermission, nnFs0.getFileStatus(path).getPermission());
+    
+    // Assert that the dir is not on the dst
+    assertFalse(nnFs1.exists(path));
+
+    // Create the same dir on the router with default permissions
+    assertTrue(routerFs.mkdirs(path));
+    
+    // Ensure the dir was created on the dst with the unusual permissions (same
+    // permissions as the src)
+    assertTrue(nnFs1.exists(path));
+    assertEquals(unusualPermission, nnFs1.getFileStatus(path).getPermission());
+  }
 
   /**
    * A helper method to write a simple, one-line string to a file.
