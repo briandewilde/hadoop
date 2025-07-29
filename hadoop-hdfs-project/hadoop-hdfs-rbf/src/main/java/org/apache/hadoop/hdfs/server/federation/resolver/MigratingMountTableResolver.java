@@ -5,9 +5,11 @@ import java.util.Objects;
 import java.util.UUID;
 import java.util.function.Function;
 import org.apache.commons.io.FilenameUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.Options;
+import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -224,11 +226,18 @@ public class MigratingMountTableResolver extends MountTableResolver {
     if (!context.isSet()) {
       MigratingMountPointInfo migratingMountPointInfo =
           context.set(migrationBehavior, path).getMigratingMountPointInfo();
+      Server.Call call = RPC.Server.getCurCall().get();
       if (migratingMountPointInfo != null) {
         // Record the mount point migration and behavior
-        LOG.info("Using migration behavior {} ({}->{}) on {}; call id {}",
-            migrationBehavior, migratingMountPointInfo.getSrcNs(),
-            migratingMountPointInfo.getDstNs(), path, getUUID());
+        LOG.info(
+            "Using migration behavior {} for {} on {} ({}->{}); call id {}",
+            migrationBehavior, call.getDetailedMetricsName(), path,
+            migratingMountPointInfo.getSrcNs(),
+            migratingMountPointInfo.getDstNs(), getUUID());
+        // Add metrics alias to indicate this op is migrating
+        call.addDetailedMetricsAlias("Migrating"
+            + StringUtils.capitalize(call.getDetailedMetricsName()));
+
         // Only DST_ONLY ops may encounter missing directories, as they do not
         // check latest
         if (migrationBehavior == MigrationBehavior.DST_ONLY) {
@@ -240,6 +249,10 @@ public class MigratingMountTableResolver extends MountTableResolver {
             missingPathHandler.copyMissingPathsFromSrc(missingPaths);
           }
         }
+      } else {
+        // Add metrics alias to indicate this op is not migrating
+        call.addDetailedMetricsAlias("NonMigrating"
+            + StringUtils.capitalize(call.getDetailedMetricsName()));
       }
     } else {
       // If the context already is set, this method is being invoked for an op

@@ -36,6 +36,8 @@ import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableE
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryResponse;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
 import org.apache.hadoop.ipc.RemoteException;
+import org.apache.hadoop.ipc.metrics.RpcDetailedMetrics;
+import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -44,6 +46,7 @@ import org.junit.Test;
 import org.mockito.Mockito;
 
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.*;
+import static org.apache.hadoop.test.MetricsAsserts.*;
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.*;
 
@@ -66,7 +69,13 @@ public class TestRouterRpcMigrationBehavior {
     cluster = new StateStoreDFSCluster(false, 2,
         MigratingMountTableResolver.class);
     Configuration routerConf =
-        new RouterConfigBuilder().stateStore().admin().quota().rpc().build();
+        new RouterConfigBuilder()
+            .stateStore()
+            .admin()
+            .metrics()
+            .quota()
+            .rpc()
+            .build();
     // Set to 1 handler thread to expose problems with thread local variables
     routerConf.setInt(DFS_ROUTER_HANDLER_COUNT_KEY, 1);
 
@@ -105,8 +114,7 @@ public class TestRouterRpcMigrationBehavior {
     RemoveMountTableEntryRequest request =
         RemoveMountTableEntryRequest.newInstance(sourcePath.toString());
     mountTableManager.removeMountTableEntry(request);
-    nnFs0.delete(sourcePath, true);
-    nnFs1.delete(sourcePath, true);
+    cluster.deleteAllFiles();
     MigratingMountTableResolver resolver =
         (MigratingMountTableResolver) routerContext.getRouter()
             .getSubclusterResolver();
@@ -568,6 +576,50 @@ public class TestRouterRpcMigrationBehavior {
     // permissions as the src)
     assertTrue(nnFs1.exists(path));
     assertEquals(unusualPermission, nnFs1.getFileStatus(path).getPermission());
+  }
+  
+  @Test
+  public void testLatencyMetrics() throws IOException {
+    setupMountTable();
+    // Create the file on src and ensure it is read
+    Path path = new Path(sourcePath, "file");
+    routerFs.create(path);
+    
+    // Read from the file to create non-migrating metrics
+    routerFs.open(path);
+    
+    // Try an op which is not supported by migration (setPermission, which is a
+    // metadata write) to ensure migrating/non-migrating metrics are not created
+    routerFs.setPermission(path, FsPermission.getDefault());
+
+    setupMountTableForMigration();
+
+    // Read from the file to create migrating metrics
+    routerFs.open(path);
+
+    // Ensure setPermission is still unsupported by migration
+    assertThrows(IOException.class,
+        () -> routerFs.setPermission(path, FsPermission.getDefault()));
+
+    // Ensure migration metrics are present for supported ops
+    MetricsRecordBuilder rpcDetailedMetrics = getMetrics(
+        routerContext.getRouterRpcServer()
+            .getServer()
+            .getRpcDetailedMetrics()
+            .name());
+    assertGaugeGt("GetBlockLocationsAvgTime", 0.0, rpcDetailedMetrics);
+    assertGaugeGt("MigratingGetBlockLocationsAvgTime", 0.0, rpcDetailedMetrics);
+    assertGaugeGt("NonMigratingGetBlockLocationsAvgTime", 0.0,
+        rpcDetailedMetrics);
+
+    // Ensure migration metrics are absent for unsupported ops
+    assertGaugeGt("SetPermissionAvgTime", 0.0, rpcDetailedMetrics);
+    assertThrows(AssertionError.class,
+        () -> getDoubleGauge("MigratingSetPermissionAvgTime",
+            rpcDetailedMetrics));
+    assertThrows(AssertionError.class,
+        () -> getDoubleGauge("NonMigratingSetPermissionAvgTime",
+            rpcDetailedMetrics));
   }
 
   /**
