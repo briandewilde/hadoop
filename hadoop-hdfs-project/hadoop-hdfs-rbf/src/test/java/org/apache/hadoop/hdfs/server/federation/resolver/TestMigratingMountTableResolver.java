@@ -84,8 +84,7 @@ public class TestMigratingMountTableResolver {
   }
   
   @After
-  public void resetMocks() throws IOException {
-    resolver.setMigrationBehavior(MigrationBehavior.UNDEFINED, path);
+  public void resetMocks() {
     // Because this test is not associated with an RPC call all invocations
     // will share the same (invalid) RPC call id. To better simulate caching,
     // reset the context between tests.
@@ -358,6 +357,43 @@ public class TestMigratingMountTableResolver {
         .evaluate()
         .assertIncludes(locationSrc, locationDst)
         .assertNotInvoked(locationSrc, locationDst);
+  }
+
+  /**
+   * Until WEBHDFS migration support is added, this ensures that an op that does
+   * not have an associated RPC call (e.g. a webhdfs call) does not throw an
+   * exception when there is no migration.
+   * @throws IOException If there is an error setting the migration behavior
+   */
+  @Test
+  public void testNoMigrationWithNoRpcServerCallSucceeds() throws IOException {
+    RPC.Server.getCurCall().remove();
+    // Ensure that setMigrationBehavior does not throw an exception
+    resolver.setMigrationBehavior(MigrationBehavior.UNION, path);
+    // Assert that the resolver only returns one path, ignoring the migration
+    // behavior because it is not migrating
+    Assert.assertEquals(1,
+        resolver.getDestinationForPath(path).getDestinations().size());
+  }
+
+  /**
+   * Until WEBHDFS migration support is added, this ensures that an op that does
+   * not hav an associated RPC call (e.g. a webhdfs call) fails when there is
+   * a migration.
+   * @throws IOException If there is an error setting the migration behavior
+   */
+  @Test
+  public void testMigrationWithNoRpcServerCallFails() throws IOException {
+    setupMigratingMountTableEntry();
+    RPC.Server.getCurCall().remove();
+    // Assert that setMigrationBehavior throws an exception because the op does
+    // not have an associated RPC call and the mount point is migrating
+    Assert.assertThrows(IllegalMigrationException.class,
+        () -> resolver.setMigrationBehavior(MigrationBehavior.LATEST, path));
+    // Assert that getDestinationForPath throws an exception because the op does
+    // not have an associated RPC call and the mount point is migrating
+    Assert.assertThrows(IllegalMigrationException.class,
+        () -> resolver.getDestinationForPath(path));
   }
 
   @Test

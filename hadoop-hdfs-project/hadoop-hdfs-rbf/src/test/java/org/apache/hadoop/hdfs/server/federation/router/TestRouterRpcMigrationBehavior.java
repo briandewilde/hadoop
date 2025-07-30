@@ -1,19 +1,24 @@
 package org.apache.hadoop.hdfs.server.federation.router;
 
-import java.io.FileNotFoundException;
 import java.io.BufferedReader;
 import java.io.BufferedWriter;
+import java.io.FileNotFoundException;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import javax.servlet.ServletContext;
+import javax.servlet.http.HttpServletRequest;
+import javax.ws.rs.core.Response;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
-import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
@@ -35,9 +40,26 @@ import org.apache.hadoop.hdfs.server.federation.store.protocol.RemoveMountTableE
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryRequest;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryResponse;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
+import org.apache.hadoop.hdfs.web.resources.BufferSizeParam;
+import org.apache.hadoop.hdfs.web.resources.DelegationParam;
+import org.apache.hadoop.hdfs.web.resources.DoAsParam;
+import org.apache.hadoop.hdfs.web.resources.ExcludeDatanodesParam;
+import org.apache.hadoop.hdfs.web.resources.FsActionParam;
+import org.apache.hadoop.hdfs.web.resources.GetOpParam;
+import org.apache.hadoop.hdfs.web.resources.LengthParam;
+import org.apache.hadoop.hdfs.web.resources.NoRedirectParam;
+import org.apache.hadoop.hdfs.web.resources.OffsetParam;
+import org.apache.hadoop.hdfs.web.resources.OldSnapshotNameParam;
+import org.apache.hadoop.hdfs.web.resources.RenewerParam;
+import org.apache.hadoop.hdfs.web.resources.SnapshotNameParam;
+import org.apache.hadoop.hdfs.web.resources.StartAfterParam;
+import org.apache.hadoop.hdfs.web.resources.TokenKindParam;
+import org.apache.hadoop.hdfs.web.resources.TokenServiceParam;
+import org.apache.hadoop.hdfs.web.resources.UserParam;
+import org.apache.hadoop.hdfs.web.resources.XAttrEncodingParam;
 import org.apache.hadoop.ipc.RemoteException;
-import org.apache.hadoop.ipc.metrics.RpcDetailedMetrics;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -49,6 +71,7 @@ import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.*;
 import static org.apache.hadoop.test.MetricsAsserts.*;
 import static org.junit.Assert.*;
 import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.Mockito.*;
 
 
 /**
@@ -620,6 +643,81 @@ public class TestRouterRpcMigrationBehavior {
     assertThrows(AssertionError.class,
         () -> getDoubleGauge("NonMigratingSetPermissionAvgTime",
             rpcDetailedMetrics));
+  }
+
+  /**
+   * Test that WEBHDFS calls fail only during migration but succeed otherwise.
+   * If migration support is enabled for WEBHDFS, this should be updated and
+   * moved to a new WEBHDFS-specific test class.
+   */
+  @Test
+  public void testWebHdfsMethodsFailOnlyDuringMigration() throws Exception {
+    // Mock the WEBHDFS servers
+    HttpServletRequest request = mock(HttpServletRequest.class);
+    ServletContext servletContext = mock(ServletContext.class);
+    when(request.getServletContext()).thenReturn(servletContext);
+    when(servletContext.getAttribute(eq("name.node")))
+        .thenReturn(routerContext.getRouter());
+
+    // Build the RouterWebHdfsMethods interface using the servlet context
+    RouterWebHdfsMethods routerMethods = new RouterWebHdfsMethods(request);
+    for (Class<?> clazz = RouterWebHdfsMethods.class; clazz != null;) {
+      try {
+        Field context = clazz.getDeclaredField("context");
+        context.setAccessible(true);
+        context.set(routerMethods, servletContext);
+        break;
+      } catch (NoSuchFieldException e) {
+        clazz = clazz.getSuperclass();
+      }
+    }
+
+    // Create the path on one namenode
+    Path path = new Path(sourcePath, "file");
+    nnFs0.create(path);
+
+    // Test that get file block locations succeeds when not migrating
+    setupMountTable();
+    invokeWebHdfsGet(routerMethods, GetOpParam.Op.GETFILEBLOCKLOCATIONS,
+        path, 0L, 0L);
+
+    // Assert that get file block locations fails when migrating
+    setupMountTableForMigration();
+    assertThrows(IllegalMigrationException.class, () -> 
+      invokeWebHdfsGet(routerMethods, GetOpParam.Op.GETFILEBLOCKLOCATIONS,
+          path, 0L, 0L));
+  }
+
+  /**
+   * Simplify invoking a WEBHDFS get method, used for internal unit tests.
+   */
+  private Response invokeWebHdfsGet(RouterWebHdfsMethods routerMethods,
+      GetOpParam.Op op, Path path, long offset, long length) throws Exception {
+    GetOpParam getOpParam = mock(GetOpParam.class);
+    when(getOpParam.getValue()).thenReturn(op);
+
+    return routerMethods.get(
+        UserGroupInformation.createRemoteUser("dummyUser"), // ugi
+        mock(DelegationParam.class), // delegation
+        mock(UserParam.class), // username
+        mock(DoAsParam.class), // doAsUser
+        path.toUri().getPath(), // fullpath
+        getOpParam, // GetOpParam
+        new OffsetParam(offset), // offset
+        new LengthParam(length), // length
+        mock(RenewerParam.class), // renewer
+        mock(BufferSizeParam.class), // bufferSize
+        new ArrayList<>(), // xattrNames
+        mock(XAttrEncodingParam.class), // xattrEncoding
+        mock(ExcludeDatanodesParam.class), // excludeDatanodes
+        mock(FsActionParam.class), // fsAction
+        mock(SnapshotNameParam.class), // snapshotName
+        mock(OldSnapshotNameParam.class), // oldSnapshotName
+        mock(TokenKindParam.class), // tokenKind
+        mock(TokenServiceParam.class), // tokenService
+        mock(NoRedirectParam.class), // noredirectParam
+        mock(StartAfterParam.class) // startAfter
+    );
   }
 
   /**

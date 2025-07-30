@@ -221,45 +221,46 @@ public class MigratingMountTableResolver extends MountTableResolver {
       throw new IllegalMigrationException(
           "MigratingMountTableResolver not initialized");
     }
-    // If the context is not yet set, then the op is sourced from the client;
-    // save the migration context and use the specified migration behavior.
-    if (!context.isSet()) {
-      MigratingMountPointInfo migratingMountPointInfo =
-          context.set(migrationBehavior, path).getMigratingMountPointInfo();
-      Server.Call call = RPC.Server.getCurCall().get();
-      if (migratingMountPointInfo != null) {
-        // Record the mount point migration and behavior
-        LOG.info(
-            "Using migration behavior {} for {} on {} ({}->{}); call id {}",
-            migrationBehavior, call.getDetailedMetricsName(), path,
-            migratingMountPointInfo.getSrcNs(),
-            migratingMountPointInfo.getDstNs(), getUUID());
-        // Add metrics alias to indicate this op is migrating
-        call.addDetailedMetricsAlias("Migrating"
-            + StringUtils.capitalize(call.getDetailedMetricsName()));
 
-        // Only DST_ONLY ops may encounter missing directories, as they do not
-        // check latest
-        if (migrationBehavior == MigrationBehavior.DST_ONLY) {
-          // Since the context is not already set, it is safe to create missing
-          // paths here; otherwise assume missing paths are already created
-          MigrationPairList<RemoteLocation> missingPaths =
-              missingPathHandler.getMissingParentPaths(new Path(path));
-          if (!missingPaths.isEmpty()) {
-            missingPathHandler.copyMissingPathsFromSrc(missingPaths);
-          }
-        }
-      } else {
-        // Add metrics alias to indicate this op is not migrating
-        call.addDetailedMetricsAlias("NonMigrating"
-            + StringUtils.capitalize(call.getDetailedMetricsName()));
-      }
-    } else {
-      // If the context already is set, this method is being invoked for an op
-      // that is internal to migration; use the saved behavior and ignore the
-      // migration behavior specified as a param.
+    // If context is set, this method is internal to an existing migration op
+    if (context.isSet()) {
+      // Use the saved behavior and ignore the specified migration behavior
       LOG.debug("Migration behavior is already set to {} on {}; call id {}",
           context.getMigrationBehavior(path), path, getUUID());
+      return;
+    }
+
+    MigratingMountPointInfo migratingMountPointInfo =
+        context.set(migrationBehavior, path).getMigratingMountPointInfo();
+    Server.Call call = RPC.Server.getCurCall().get();
+    if (migratingMountPointInfo != null) {
+      // Record the mount point migration and behavior
+      LOG.info(
+          "Using migration behavior {} for {} on {} ({}->{}); call id {}",
+          migrationBehavior, call.getDetailedMetricsName(), path,
+          migratingMountPointInfo.getSrcNs(),
+          migratingMountPointInfo.getDstNs(), getUUID());
+      // Add metrics alias to indicate this op is migrating
+      call.addDetailedMetricsAlias("Migrating"
+          + StringUtils.capitalize(call.getDetailedMetricsName()));
+
+      // Only DST_ONLY ops may encounter missing directories, as they do not
+      // check latest
+      if (migrationBehavior == MigrationBehavior.DST_ONLY) {
+        // Since the context is not already set, it is safe to create missing
+        // paths here; otherwise assume missing paths are already created
+        MigrationPairList<RemoteLocation> missingPaths =
+            missingPathHandler.getMissingParentPaths(new Path(path));
+        if (!missingPaths.isEmpty()) {
+          missingPathHandler.copyMissingPathsFromSrc(missingPaths);
+        }
+      }
+    } else {
+      // If there is an associated RPC call, add a non-migrating metrics alias
+      if (call != null) {
+        call.addDetailedMetricsAlias("NonMigrating" + StringUtils.capitalize(
+            call.getDetailedMetricsName()));
+      }
     }
   }
 
@@ -1024,12 +1025,18 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * Build a UUID from the current call. At present, this builds a UUID from:
    *  - The call timestamp, ensuring that sequential calls always have a UUID
    *  - The call id, ensuring that calls with the same timestamp have a UUID
-   * @return A UUID based on the current RPC call
+   * @return A UUID based on the current RPC call, or null if there is no
+   *         associated RPC call
    */
   @VisibleForTesting
   UUID getUUID() {
-    return new UUID(RPC.Server.getCallId(),
-        RPC.Server.getCurCall().get().getTimestampNanos());
+    if (RPC.Server.getCurCall() == null
+        || RPC.Server.getCurCall().get() == null) {
+      return null;
+    } else {
+      return new UUID(RPC.Server.getCallId(),
+          RPC.Server.getCurCall().get().getTimestampNanos());
+    }
   }
 
   private static class MigrationPairList<T>
@@ -1144,6 +1151,10 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return True if the context is set, false otherwise
      */
     public boolean isSet() {
+      if (getUUID() == null) {
+        // If there is no UUID, the context cannot be set
+        return false;
+      }
       Pair<UUID, MigrationContextEntry> pair = cache.get();
       return pair != null && pair.getKey().equals(getUUID());
     }
@@ -1157,9 +1168,19 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     public MigrationContextEntry set(MigrationBehavior migrationBehavior,
         String path) throws IOException {
-      MigrationContextEntry
-          value = new MigrationContextEntry(migrationBehavior, path);
-      cache.set(Pair.of(getUUID(), value));
+      MigrationContextEntry value;
+      if (getUUID() == null) {
+        // If the UUID is not set, return a new local MigrationContextEntry with
+        // an UNDEFINED migration behavior and the current migrating mount point
+        value = new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
+        if (value.getMigratingMountPointInfo() != null) {
+          throw new IllegalMigrationException(
+              "Migration is only supported for RPC protocol");
+        }
+      } else {
+        value = new MigrationContextEntry(migrationBehavior, path);
+        cache.set(Pair.of(getUUID(), value));
+      }
       return value;
     }
 
@@ -1181,12 +1202,22 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     private MigrationContextEntry getOrSet(String path) throws IOException {
       Pair<UUID, MigrationContextEntry> pair = cache.get();
+      MigrationContextEntry value;
       // Reset the context if it is not set or was set for an old operation
-      if (pair == null || !pair.getKey().equals(getUUID())) {
-        return set(MigrationBehavior.UNDEFINED, path);
+      if (getUUID() == null) {
+        // If the UUID is not set, return a new local MigrationContextEntry with
+        // an UNDEFINED migration behavior and the current migrating mount point
+        value = new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
+        if (value.getMigratingMountPointInfo() != null) {
+          throw new IllegalMigrationException(
+              "Migration is only supported for RPC protocol");
+        }
+      } else if (pair == null || !pair.getKey().equals(getUUID())) {
+        value = set(MigrationBehavior.UNDEFINED, path);
       } else {
-        return pair.getValue();
+        value = pair.getValue();
       }
+      return value;
     }
 
     /**
