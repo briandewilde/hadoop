@@ -226,15 +226,19 @@ public class MigratingMountTableResolver extends MountTableResolver {
     if (context.isSet()) {
       // Use the saved behavior and ignore the specified migration behavior
       LOG.debug("Migration behavior is already set to {} on {}; call id {}",
-          context.getMigrationBehavior(path), path, getUUID());
+          context.get().getMigrationBehavior(), path, getUUID());
       return;
     }
 
     MigratingMountPointInfo migratingMountPointInfo =
-        context.set(migrationBehavior, path).getMigratingMountPointInfo();
+        context.create(migrationBehavior, path).getMigratingMountPointInfo();
     Server.Call call = RPC.Server.getCurCall().get();
-    if (migratingMountPointInfo != null) {
-      // Record the mount point migration and behavior
+
+    if (migratingMountPointInfo != null && call == null) {
+      // Migration is not supported if there is no associated RPC call
+      throw new IllegalMigrationException("Migration only supported for RPC");
+    } else if (migratingMountPointInfo != null) {
+      // For migration via RPC, record the mount point migration and behavior
       LOG.info(
           "Using migration behavior {} for {} on {} ({}->{}); call id {}",
           migrationBehavior, call.getDetailedMetricsName(), path,
@@ -255,12 +259,10 @@ public class MigratingMountTableResolver extends MountTableResolver {
           missingPathHandler.copyMissingPathsFromSrc(missingPaths);
         }
       }
-    } else {
+    } else if (call != null) {
       // If there is an associated RPC call, add a non-migrating metrics alias
-      if (call != null) {
-        call.addDetailedMetricsAlias("NonMigrating" + StringUtils.capitalize(
-            call.getDetailedMetricsName()));
-      }
+      call.addDetailedMetricsAlias("NonMigrating" + StringUtils.capitalize(
+          call.getDetailedMetricsName()));
     }
   }
 
@@ -470,14 +472,15 @@ public class MigratingMountTableResolver extends MountTableResolver {
    */
   @Override
   public PathLocation getDestinationForPath(String path) throws IOException {
-    if (context.getMigratingMountPointInfo(path) == null) {
+    if (context.getOrCreate(MigrationBehavior.UNDEFINED, path)
+        .getMigratingMountPointInfo() == null) {
       // There is no saved context if the mount point is not migrating or
       // if the migration behavior is not set.
       return super.getDestinationForPath(path);
     } else {
       MigrationPair<RemoteLocation> remoteLocations = getRemoteLocations(path);
       List<RemoteLocation> targetLocations;
-      MigrationBehavior migrationBehavior = context.getMigrationBehavior(path);
+      MigrationBehavior migrationBehavior = context.get().getMigrationBehavior();
       switch (migrationBehavior) {
         case SRC_ONLY:
           targetLocations =
@@ -529,12 +532,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
   private MigrationPair<RemoteLocation> getRemoteLocations(String path)
       throws IOException {
     MigratingMountPointInfo migratingMountPointInfo =
-        context.getMigratingMountPointInfo(path);
-    if (migratingMountPointInfo == null) {
-      throw new IllegalMigrationException(String.format("Path %s is not on a"
-          + " migrating mount point", path));
-    }
-    PathLocation pathLocation = getPathLocation(path);
+        context.get().getMigratingMountPointInfo();
+    PathLocation pathLocation = context.get().getRemoteLocations(path);
     RemoteLocation srcLocation = null;
     RemoteLocation dstLocation = null;
     for (RemoteLocation loc : pathLocation.getDestinations()) {
@@ -555,36 +554,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
           getUUID()));
     }
     return MigrationPair.of(srcLocation, dstLocation);
-  }
-
-  /**
-   * Get the location for the given path. This attempts to load the location
-   * from the migration context but falls back to the super method, which
-   * specifically ensures that ops complete as expected when a migrating mount
-   * point succeeds (and the source or destination locations removed); in cases
-   * where it fails, this should have no effect other than to allow in-flight
-   * ops to continue to the source and/or destination consistently. (It will not
-   * prevent failures to create missing destination directories, however there
-   * should be no missing destination dirs if migration succeeded.)
-   * <p>
-   * This should generally replace calls to super.getDestinationForPath(path)
-   * made from within MigratingMountTableResolver.
-   * @param path The path for which the location should be retrieved
-   * @return The location for the given path or null if it does not exist
-   * @throws IOException If an error occurs while retrieving the location
-   */
-  private PathLocation getPathLocation(String path)
-      throws IOException {
-    PathLocation defaultLocation = context.getRemoteLocations(path);
-    if (defaultLocation == null) {
-      // This can occur if an operation tries to get path locations for a
-      // different path (e.g. parent); it is not an error, but a cache miss.
-      LOG.warn("Path {} is not in the migration context; call id {}",
-          path, getUUID());
-      return super.getDestinationForPath(path);
-    } else {
-      return defaultLocation;
-    }
   }
 
   /**
@@ -673,7 +642,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     private MigrationPairList<RemoteLocation> getMissingParentPaths(
         Path path) throws IOException {
-      String sourcePath = getPathLocation(path.toUri().getPath())
+      String sourcePath = context.get()
+          .getRemoteLocations(path.toUri().getPath())
           .getSourcePath();
 
       // Build a list of all possible paths
@@ -745,7 +715,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // The original path is the last path in the list of missing paths
       String path = missingPaths.getLast().getPath(RemoteLocation::getSrc);
       // The mount point root is saved as the path location's source path
-      String mpRoot = getPathLocation(path).getSourcePath();
+      String mpRoot = context.get().getRemoteLocations(path).getSourcePath();
       // Use the destination location in the prefix for the missing paths
       Path prefix = new Path(getMountPointTempPrefix(new Path(mpRoot)),
           UUID.randomUUID().toString());
@@ -1151,37 +1121,76 @@ public class MigratingMountTableResolver extends MountTableResolver {
      * @return True if the context is set, false otherwise
      */
     public boolean isSet() {
-      if (getUUID() == null) {
+      UUID key = getUUID();
+      if (key == null) {
         // If there is no UUID, the context cannot be set
         return false;
       }
       Pair<UUID, MigrationContextEntry> pair = cache.get();
-      return pair != null && pair.getKey().equals(getUUID());
+      return pair != null && pair.getKey().equals(key);
     }
 
     /**
-     * Set the current operation's migration behavior and save the context.
+     * Create the migration context for the current operation.
      * @param migrationBehavior The migration behavior to be set
      * @param path The path for which the migration behavior is set
-     * @return The migration context entry that was created
+     * @throws IllegalMigrationException If an error occurs
+     */
+    public MigrationContextEntry create(MigrationBehavior migrationBehavior,
+        String path) throws IOException {
+      UUID key = getUUID();
+      if (key == null) {
+        return new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
+      } else if (isSet()) {
+        throw new IllegalMigrationException(
+            "Migration context cannot be overwritten");
+      } else {
+        MigrationContextEntry entry =
+            new MigrationContextEntry(migrationBehavior, path);
+        cache.set(Pair.of(key, entry));
+        return entry;
+      }
+    }
+
+    /**
+     * Get the current operation's migration context, or create the migration
+     * context if it does not already exist. This never returns null.
+     * @param migrationBehavior The migration behavior to use for creation
+     * @param path The path for which the migration behavior is set
+     * @return The migration context for the current operation
      * @throws IOException If an error occurs
      */
-    public MigrationContextEntry set(MigrationBehavior migrationBehavior,
-        String path) throws IOException {
-      MigrationContextEntry value;
-      if (getUUID() == null) {
-        // If the UUID is not set, return a new local MigrationContextEntry with
-        // an UNDEFINED migration behavior and the current migrating mount point
-        value = new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
-        if (value.getMigratingMountPointInfo() != null) {
-          throw new IllegalMigrationException(
-              "Migration is only supported for RPC protocol");
-        }
+    public MigrationContextEntry getOrCreate(
+        MigrationBehavior migrationBehavior, String path) throws IOException {
+      UUID key = getUUID();
+      if (key == null) {
+        return new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
+      } else if (isSet()) {
+        return get();
       } else {
-        value = new MigrationContextEntry(migrationBehavior, path);
-        cache.set(Pair.of(getUUID(), value));
+        MigrationContextEntry entry =
+            new MigrationContextEntry(migrationBehavior, path);
+        cache.set(Pair.of(key, entry));
+        return entry;
       }
-      return value;
+    }
+
+    /**
+     * Get the current operation's migration context. If the context is not
+     * set for the current operation, this throws an exception.
+     * @return The migration context for the current operation
+     * @throws IllegalMigrationException If the migration context is not set
+     */
+    public MigrationContextEntry get() throws IllegalMigrationException {
+      Pair<UUID, MigrationContextEntry> pair = cache.get();
+      // Reset the context if it is not set or was set for an old operation
+      if (pair == null || !pair.getKey().equals(getUUID())) {
+        throw new IllegalMigrationException(
+            String.format("Migration context is not set; call id %s",
+                getUUID()));
+      } else {
+        return pair.getValue();
+      }
     }
 
     /**
@@ -1190,92 +1199,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
     @VisibleForTesting
     public void reset() {
       cache.remove();
-    }
-
-    /**
-     * Get the current operation's migration context. If the context is not
-     * set for the current operation, this saves the migration context with
-     * the default migration behavior of UNDEFINED. This never returns null.
-     * @param path The path for which the migration behavior is set
-     * @return The migration context for the current operation
-     * @throws IOException If an error occurs
-     */
-    private MigrationContextEntry getOrSet(String path) throws IOException {
-      Pair<UUID, MigrationContextEntry> pair = cache.get();
-      MigrationContextEntry value;
-      // Reset the context if it is not set or was set for an old operation
-      if (getUUID() == null) {
-        // If the UUID is not set, return a new local MigrationContextEntry with
-        // an UNDEFINED migration behavior and the current migrating mount point
-        value = new MigrationContextEntry(MigrationBehavior.UNDEFINED, path);
-        if (value.getMigratingMountPointInfo() != null) {
-          throw new IllegalMigrationException(
-              "Migration is only supported for RPC protocol");
-        }
-      } else if (pair == null || !pair.getKey().equals(getUUID())) {
-        value = set(MigrationBehavior.UNDEFINED, path);
-      } else {
-        value = pair.getValue();
-      }
-      return value;
-    }
-
-    /**
-     * Get the current operation's migration context. If the context is not
-     * set for the current operation, this returns null and does NOT set it.
-     * @return The migration context for the current operation
-     */
-    private MigrationContextEntry get() {
-      Pair<UUID, MigrationContextEntry> pair = cache.get();
-      // Reset the context if it is not set or was set for an old operation
-      if (pair == null || !pair.getKey().equals(getUUID())) {
-        return null;
-      } else {
-        return pair.getValue();
-      }
-    }
-
-    /**
-     * Get the current operation's migration behavior. If the context is
-     * not set for the current operation, this saves the migration context
-     * and returns the default migration behavior of UNDEFINED.
-     * @param path The path for which the migration behavior is set
-     * @return The migration behavior, or UNDEFINED if not set
-     */
-    public MigrationBehavior getMigrationBehavior(String path)
-        throws IOException {
-      return getOrSet(path).getMigrationBehavior();
-    }
-
-    /**
-     * Get the current operation's migrating mount point info. If the context is
-     * not set for the current operation, this saves the migration context and
-     * returns the current migrating mount point info.
-     * @param path The path to which the migrating mount point info should apply
-     * @return The migrating mount point info, or null if not migrating
-     */ 
-    public MigratingMountPointInfo getMigratingMountPointInfo(String path)
-        throws IOException {
-      return getOrSet(path).getMigratingMountPointInfo();
-    }
-
-    /**
-     * Get the current operation's remote locations. This returns the default
-     * remote locations from when the context was saved only if they match
-     * the path, else null. If the context is not set for the current operation,
-     * this saves the migration context and returns the current remote
-     * locations.
-     * @param path The path for which the remote locations should be retrieved
-     * @return The corresponding PathLocation, or null if not set
-     */ 
-    public PathLocation getRemoteLocations(String path) throws IOException {
-      PathLocation defaultLocation = getOrSet(path).getDefaultLocation();
-      if (defaultLocation != null && defaultLocation.getSourcePath() != null
-          && defaultLocation.getDefaultLocation().getSrc().equals(path)) {
-        return defaultLocation;
-      } else {
-        return null;
-      }
     }
 
     /**
@@ -1289,11 +1212,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
     public <T> T overrideBehavior(MigrationBehavior overrideBehavior,
         RemoteMethodSupplier<T> supplier) throws IOException {
       MigrationContextEntry contextEntry = get();
-      if (contextEntry == null) {
-        throw new IllegalMigrationException(
-            String.format("Migration context is not set; call id %s",
-                getUUID()));
-      }
       try {
         contextEntry.setOverrideBehavior(overrideBehavior);
         return supplier.get();
@@ -1335,8 +1253,15 @@ public class MigratingMountTableResolver extends MountTableResolver {
         return migratingMountPointInfo;
       }
       
-      public PathLocation getDefaultLocation() {
-        return defaultLocation;
+      public PathLocation getRemoteLocations(String path) throws IOException {
+        if (defaultLocation != null && defaultLocation.getSourcePath() != null
+          && defaultLocation.getDefaultLocation().getSrc().equals(path)) {
+          return defaultLocation;
+        } else {
+          LOG.warn("Path {} is not in the migration context; call id {}",
+              path, getUUID());
+          return MigratingMountTableResolver.super.getDestinationForPath(path);
+        }
       }
       
       private void setOverrideBehavior(MigrationBehavior overrideBehavior) {
