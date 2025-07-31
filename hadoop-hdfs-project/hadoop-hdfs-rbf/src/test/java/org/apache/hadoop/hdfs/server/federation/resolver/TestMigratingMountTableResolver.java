@@ -6,6 +6,8 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.BiFunction;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
@@ -15,6 +17,8 @@ import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.protocol.HdfsLocatedFileStatus;
 import org.apache.hadoop.hdfs.protocol.LocatedBlocks;
+import org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics;
+import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteMethod;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteResult;
 import org.apache.hadoop.hdfs.server.federation.router.RouterRpcClient;
@@ -22,6 +26,8 @@ import org.apache.hadoop.hdfs.server.federation.router.RouterRpcServer;
 import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.Server;
+import org.apache.hadoop.metrics2.MetricsRecordBuilder;
+import org.apache.hadoop.test.MetricsAsserts;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ArrayListMultimap;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableMap;
 import org.apache.hadoop.thirdparty.com.google.common.collect.Multimap;
@@ -31,6 +37,10 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.CounterMetric.*;
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.GaugeMetric.*;
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.QuantileMetric.*;
+import static org.junit.Assert.*;
 import static org.mockito.Mockito.*;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver.MigrationBehavior;
 import org.mockito.ArgumentCaptor;
@@ -58,6 +68,7 @@ public class TestMigratingMountTableResolver {
       mock(HdfsFileStatus.class);
   private static final HdfsFileStatus presentDirInfo =
       mock(HdfsFileStatus.class);
+  private static final int quantileInterval = 60;
 
   public TestMigratingMountTableResolver() {
     when(newerFileInfo.getModificationTime()).thenReturn(2L);
@@ -70,6 +81,9 @@ public class TestMigratingMountTableResolver {
   public void setup() throws IOException {
     Configuration conf = new Configuration();
     conf.setStrings(DFSConfigKeys.DFS_NAMESERVICES, "ns0", "ns1");
+    conf.setBoolean(RBFConfigKeys.MIGRATION_METRICS_QUANTILE_ENABLE, true);
+    conf.setStrings(RBFConfigKeys.MIGRATION_METRICS_PERCENTILES_INTERVALS,
+        Integer.toString(quantileInterval));
     resolver = new MigratingMountTableResolver(conf, null);
     rpcServerMock = mock(RouterRpcServer.class);
     rpcClientMock = mock(RouterRpcClient.class);
@@ -81,8 +95,9 @@ public class TestMigratingMountTableResolver {
             "Test".getBytes()));
 
     setupMountTableEntry();
+    resolver.resetMigrationMetrics();
   }
-  
+
   @After
   public void resetMocks() {
     // Because this test is not associated with an RPC call all invocations
@@ -131,7 +146,8 @@ public class TestMigratingMountTableResolver {
   @Test
   public void testReconcileNormalEntryForOneNs() throws IOException {
     MountTable entry = setupMountTableEntry();
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry, null);
+    resolver.reconcileEntryWithMigration(entry, null);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
   }
 
   @Test
@@ -140,22 +156,26 @@ public class TestMigratingMountTableResolver {
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     MountTable migrationEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry, null);
+        resolver.reconcileEntryWithMigration(entry, null);
     Assert.assertTrue(migrationEntry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
   }
-  
+
   @Test
   public void testReconcileMigrationEntryForSrcNsAddsDst() throws IOException {
     MountTable entry = setupMountTableEntry();
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     MountTable migrationEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry, null);
+        resolver.reconcileEntryWithMigration(entry, null);
     Assert.assertTrue(migrationEntry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
   }
 
   @Test
@@ -164,18 +184,16 @@ public class TestMigratingMountTableResolver {
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     Assert.assertThrows(IOException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry,
-            null));
+        () -> resolver.reconcileEntryWithMigration(entry, null));
   }
-  
+
   @Test
   public void testReconcileMigrationEntryThrowsForSameNs() throws IOException {
     MountTable entry = setupMountTableEntry();
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns0"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry,
-            null));
+        () -> resolver.reconcileEntryWithMigration(entry, null));
   }
 
   @Test
@@ -185,8 +203,7 @@ public class TestMigratingMountTableResolver {
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("nsZ", "ns0"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry,
-            null));
+        () -> resolver.reconcileEntryWithMigration(entry, null));
   }
 
   @Test
@@ -195,8 +212,7 @@ public class TestMigratingMountTableResolver {
     MountTable entry = setupMountTableEntry("nsZ");
     entry.setMigratingMountPointInfo(new MigratingMountPointInfo("ns0", "ns1"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry,
-            null));
+        () -> resolver.reconcileEntryWithMigration(entry, null));
   }
 
   @Test
@@ -204,7 +220,11 @@ public class TestMigratingMountTableResolver {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
+
+    // Assert metrics are updated for the migration
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -212,8 +232,7 @@ public class TestMigratingMountTableResolver {
     MountTable entry2 = MountTable.newInstance(path, destMap);
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns1", "ns0"));
-    MountTable endEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry2, entry1);
+    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
 
     Assert.assertTrue(endEntry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
@@ -223,6 +242,11 @@ public class TestMigratingMountTableResolver {
         endEntry.getMigratingMountPointInfo().getDstNs());
     Assert.assertEquals("ns1",
         endEntry.getMigratingMountPointInfo().getSrcNs());
+
+    // Assert metrics are updated for original and rollback migrations
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns1->ns0", 1L);
   }
 
   @Test
@@ -231,7 +255,7 @@ public class TestMigratingMountTableResolver {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -240,8 +264,7 @@ public class TestMigratingMountTableResolver {
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns1", "ns1"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry2,
-            entry1));
+        () -> resolver.reconcileEntryWithMigration(entry2, entry1));
   }
 
   @Test
@@ -250,7 +273,7 @@ public class TestMigratingMountTableResolver {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -259,28 +282,34 @@ public class TestMigratingMountTableResolver {
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns1", "ns1"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry1,
-            entry2));
+        () -> resolver.reconcileEntryWithMigration(entry1, entry2));
   }
-  
+
   @Test
   public void testReconcileMigrationEntryCompletesKeepingSrc()
       throws IOException {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
+
+    // Assert metrics are set
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
     MountTable entry2 = MountTable.newInstance(path, destMap);
-    MountTable endEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry2, entry1);
-    
+    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
+
     Assert.assertNull(endEntry.getMigratingMountPointInfo());
     Assert.assertEquals(1, endEntry.getDestinations().size());
     Assert.assertEquals("ns0",
         endEntry.getDestinations().iterator().next().getNameserviceId());
+
+    // Assert metrics are reset
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
   }
 
   @Test
@@ -289,27 +318,34 @@ public class TestMigratingMountTableResolver {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
+
+    // Assert metrics are set
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns1", path);
     MountTable entry2 = MountTable.newInstance(path, destMap);
-    MountTable endEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry2, entry1);
+    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
 
     Assert.assertNull(endEntry.getMigratingMountPointInfo());
     Assert.assertEquals(1, endEntry.getDestinations().size());
     Assert.assertEquals("ns1",
         endEntry.getDestinations().iterator().next().getNameserviceId());
+
+    // Assert metrics are reset
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
   }
-  
+
   @Test
   public void testReconcileMigrationEntryThrowsForRemovingSrc()
       throws IOException {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns1", path);
@@ -317,17 +353,16 @@ public class TestMigratingMountTableResolver {
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     Assert.assertThrows(IllegalMigrationException.class,
-        () -> MigratingMountTableResolver.reconcileEntryWithMigration(entry2,
-            entry1));
+        () -> resolver.reconcileEntryWithMigration(entry2, entry1));
   }
-  
+
   @Test
   public void testReconcileMigrationEntryAddsDstForRemovingDst()
       throws IOException {
     MountTable entry1 = setupMountTableEntry("ns0");
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MigratingMountTableResolver.reconcileEntryWithMigration(entry1, null);
+    resolver.reconcileEntryWithMigration(entry1, null);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -335,7 +370,7 @@ public class TestMigratingMountTableResolver {
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     MountTable migrationEntry =
-        MigratingMountTableResolver.reconcileEntryWithMigration(entry2, entry1);
+        resolver.reconcileEntryWithMigration(entry2, entry1);
     Assert.assertTrue(migrationEntry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
@@ -357,6 +392,9 @@ public class TestMigratingMountTableResolver {
         .evaluate()
         .assertIncludes(locationSrc, locationDst)
         .assertNotInvoked(locationSrc, locationDst);
+
+    // Assert that no migration metrics are updated
+    assertSrcDstOpMetrics(0L, 0L);
   }
 
   /**
@@ -407,6 +445,12 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationSrc)
         .assertExcludes(locationDst)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the source is included and the destination is excluded
+    assertSrcDstOpMetrics(1L, 0L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -420,8 +464,14 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
-  
+
   @Test
   public void testLatestBehaviorDefaultsToDst() throws IOException {
     setupMigratingMountTableEntry();
@@ -433,8 +483,14 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
-  
+
   @Test
   public void testLatestBehaviorAlwaysUsesDstDir() throws IOException {
     when(newerFileInfo.isDirectory()).thenReturn(true);
@@ -450,6 +506,12 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -468,6 +530,12 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationSrc)
         .assertExcludes(locationDst)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the source is included and the destination is excluded
+    assertSrcDstOpMetrics(1L, 0L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -486,6 +554,12 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc, locationDst);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -510,6 +584,12 @@ public class TestMigratingMountTableResolver {
     verify(rpcClientMock, times(1)).invokeConcurrent(anyList(),
         any(RemoteMethod.class), anyBoolean(), anyLong(),
         eq(LocatedBlocks.class));
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -530,8 +610,14 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
-  
+
   @Test
   public void testLeasedBehaviorHandlesMissingDstBlocks()
       throws IOException {
@@ -550,6 +636,12 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
 
   @Test
@@ -567,8 +659,14 @@ public class TestMigratingMountTableResolver {
         .assertIncludes(locationDst)
         .assertExcludes(locationSrc)
         .assertInvoked(locationSrc);
+
+    // Assert that the destination is included and the source is excluded
+    assertSrcDstOpMetrics(0L, 1L);
+    // Assert that there are two routing ops in one batch
+    assertQuantileMedian(QM_ROUTING_OPS, 2L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 1L);
   }
-  
+
   @Test
   public void testUnionBehaviorIncludesBoth() throws IOException {
     setupMigratingMountTableEntry();
@@ -579,8 +677,14 @@ public class TestMigratingMountTableResolver {
         .evaluate()
         .assertIncludes(locationSrc, locationDst)
         .assertNotInvoked(locationSrc, locationDst);
+
+    // Assert that both source and destination are included
+    assertSrcDstOpMetrics(1L, 1L);
+    // Assert that there are no routing ops and no batches
+    assertQuantileMedian(QM_ROUTING_OPS, 0L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 0L);
   }
-  
+
   @Test
   public void testUndefinedBehaviorThrows() throws IOException {
     setupMigratingMountTableEntry();
@@ -589,6 +693,12 @@ public class TestMigratingMountTableResolver {
             () -> new TestHelper().evaluate());
     Assert.assertTrue(
         e.getMessage().contains("Operation has no defined migration behavior"));
+
+    // Assert that neither source nor destination is included
+    assertSrcDstOpMetrics(0L, 0L);
+    // Assert that there are no routing ops and no batches
+    assertQuantileMedian(QM_ROUTING_OPS, 0L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 0L);
   }
 
   @Test
@@ -598,8 +708,13 @@ public class TestMigratingMountTableResolver {
         () -> new TestHelper().evaluate());
     Assert.assertTrue(
         e.getMessage().contains("Operation has no defined migration behavior"));
+    // Assert that neither source nor destination is included
+    assertSrcDstOpMetrics(0L, 0L);
+    // Assert that there are no routing ops and no batches
+    assertQuantileMedian(QM_ROUTING_OPS, 0L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 0L);
   }
-  
+
   @Test
   public void testMissingDirCreationFilePresentOnSrc() throws IOException {
     setupMigratingMountTableEntry();
@@ -619,6 +734,11 @@ public class TestMigratingMountTableResolver {
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir"), any());
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir/file"),
         any());
+
+    // Assert that no dirs are listed as missing due to short-circuit
+    assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 0L);
   }
 
   @Test
@@ -638,6 +758,15 @@ public class TestMigratingMountTableResolver {
     verify(rpcServerMock, times(1)).rename2(anyString(), eq("/mp0/dir"), any());
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir/file"),
         any());
+
+    // Assert that only the parent is missing (path is a file)
+    assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 1L);
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_OPS, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_BATCHES, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, n -> n > 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 1L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 1L);
   }
 
   @Test
@@ -646,7 +775,7 @@ public class TestMigratingMountTableResolver {
     mockPresentPaths(ImmutableMap.of(
         "/mp0", new MockedNode(presentDirInfo, presentDirInfo),
         "/mp0/dir", new MockedNode(presentDirInfo, missingFileInfo),
-        "/mp0/dir/file", new MockedNode(missingFileInfo, missingFileInfo)
+        "/mp0/dir/file", new MockedNode(presentDirInfo, missingFileInfo)
     ));
     resolver.setMigrationBehavior(MigrationBehavior.DST_ONLY, "/mp0/dir/file");
 
@@ -657,6 +786,15 @@ public class TestMigratingMountTableResolver {
     verify(rpcServerMock, times(1)).rename2(anyString(), eq("/mp0/dir"), any());
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir/file"),
         any());
+
+    // Assert that the parent and current file are both missing
+    assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 2L);
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_OPS, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_BATCHES, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, n -> n > 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 1L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 1L);
   }
 
   @Test
@@ -676,8 +814,18 @@ public class TestMigratingMountTableResolver {
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir"), any());
     verify(rpcServerMock, never()).rename2(anyString(), eq("/mp0/dir/file"),
         any());
+
+    // Assert that no dirs are missing
+    assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 0L);
+    // Assert that detection occurred, but no creation
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_OPS, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_DETECTION_BATCHES, n -> n > 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, 0L);
+    assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 0L);
   }
-  
+
   @Ignore
   @Test
   public void testMissingDirCreationDeduplicates() throws IOException {
@@ -690,7 +838,7 @@ public class TestMigratingMountTableResolver {
     ));
     resolver.setMigrationBehavior(MigrationBehavior.DST_ONLY,
         "/mp0/dir/subA/file");
-    
+
     // Reset context because two invocations should not share the same call id
     resolver.resetContext();
     
@@ -713,7 +861,7 @@ public class TestMigratingMountTableResolver {
     verify(rpcClientMock, atLeast(4)).invokeConcurrent(captor.capture(),
         any(RemoteMethod.class), anyBoolean(), anyLong(),
         eq(HdfsFileStatus.class));
-    
+
     List<RemoteLocation> allQueriedLocations = captor.getAllValues().stream()
         .flatMap(List::stream)
         .collect(Collectors.toList());
@@ -745,7 +893,7 @@ public class TestMigratingMountTableResolver {
         new MockedNode(presentDirInfo, missingFileInfo));
     presentPaths.put("/mp0/A/B/C/D/file",
         new MockedNode(missingFileInfo, missingFileInfo));
-    
+
     mockPresentPaths(presentPaths);
     resolver.setMigrationBehavior(MigrationBehavior.DST_ONLY,
         "/mp0/A/B/C/D/file");
@@ -770,14 +918,19 @@ public class TestMigratingMountTableResolver {
     Assert.assertFalse(allQueriedLocations.stream()
         .anyMatch(l -> l.getNameserviceId().equals("ns1") && l.getSrc()
             .equals("/mp0/A/B/C")));
+
+    // Assert that all four parent/ancestor dirs are missing
+    assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 4L);
   }
-  
+
   @Test
   public void testDefaultBehaviorResetsToUndefinedAndThrows()
-    throws IOException {
+      throws IOException {
     setupMigratingMountTableEntry();
     resolver.setMigrationBehavior(MigrationBehavior.LATEST, path);
     new TestHelper().evaluate();
+
+    resolver.resetMigrationMetrics();
 
     // Set the RPC call ID to 2 to simulate another RPC call on the same thread
     RPC.Server.getCurCall()
@@ -787,8 +940,11 @@ public class TestMigratingMountTableResolver {
         () -> new TestHelper().evaluate());
     Assert.assertTrue(
         e.getMessage().contains("Operation has no defined migration behavior"));
+    assertSrcDstOpMetrics(0L, 0L);
+    assertQuantileMedian(QM_ROUTING_OPS, 0L);
+    assertQuantileMedian(QM_ROUTING_BATCHES, 0L);
   }
-  
+
   @Test
   public void testOtherPathFetchesRemoteLocationFromResolver()
       throws IOException {
@@ -799,7 +955,7 @@ public class TestMigratingMountTableResolver {
     // Cached location is for path, so assert pathLocation is path + "/foo"
     Assert.assertEquals(path + "/foo", pathLocation.getSourcePath());
   }
-  
+
   @Test
   public void testComparingFilesAndDirectoriesFails() throws IOException {
     setupMigratingMountTableEntry();
@@ -841,7 +997,7 @@ public class TestMigratingMountTableResolver {
     // Assert that the current mount table is not migrating
     Assert.assertNull(
         resolver.getMountPoint(path).getMigratingMountPointInfo());
-    
+
     // Assert that the resolver still includes the destination
     new TestHelper()
         .addResult(locationSrc, newerFileInfo, HdfsFileStatus.class)
@@ -933,7 +1089,7 @@ public class TestMigratingMountTableResolver {
     Assert.assertTrue(
         e.getMessage().contains("Operation has no defined migration behavior"));
   }
-  
+
   private static class TestHelper {
     final Multimap<Class<?>, RemoteResult<RemoteLocation, ?>> resultsMap;
     final List<RemoteLocation> invokedLocations;
@@ -949,11 +1105,11 @@ public class TestMigratingMountTableResolver {
       resultsMap.put(clazz, new RemoteResult<>(location, object));
       return this;
     }
-    
+
     TestHelper evaluate() throws IOException {
       return evaluate(path);
     }
-    
+
     void injectMocks() throws IOException {
       // Mock the RPC client to return the results
       for (Class<?> clazz : resultsMap.keySet()) {
@@ -964,7 +1120,7 @@ public class TestMigratingMountTableResolver {
                 anyLong(), eq(clazz));
       }
     }
-    
+
     TestHelper evaluate(String path) throws IOException {
       injectMocks();
 
@@ -986,28 +1142,28 @@ public class TestMigratingMountTableResolver {
       }
       return this;
     }
-    
+
     TestHelper assertIncludes(RemoteLocation... locations) {
       for (RemoteLocation location : locations) {
         Assert.assertTrue(destination.getDestinations().contains(location));
       }
       return this;
     }
-    
+
     TestHelper assertExcludes(RemoteLocation... locations) {
       for (RemoteLocation location : locations) {
         Assert.assertFalse(destination.getDestinations().contains(location));
       }
       return this;
     }
-    
+
     TestHelper assertInvoked(RemoteLocation... locations) {
       for (RemoteLocation location : locations) {
         Assert.assertTrue(invokedLocations.contains(location));
       }
       return this;
     }
-    
+
     TestHelper assertNotInvoked(RemoteLocation... locations) {
       for (RemoteLocation location : locations) {
         Assert.assertFalse(invokedLocations.contains(location));
@@ -1034,6 +1190,7 @@ public class TestMigratingMountTableResolver {
           .build()
       );
     }
+
     public MockedNode(HdfsFileStatus srcStatus,
         HdfsFileStatus dstStatus, AclStatus aclStatus) {
       this.srcStatus = srcStatus;
@@ -1079,5 +1236,77 @@ public class TestMigratingMountTableResolver {
    */
   private static String getParentString(String path) {
     return new Path(path).getParent().toUri().getPath();
+  }
+
+  /**
+   * Assert that the op metrics to src and dst match the expected values.
+   * @param src Number of source operations
+   * @param dst Number of destination operations
+   */
+  private void assertSrcDstOpMetrics(long src, long dst) {
+    assertConditionalCounter(CM_NUM_SRC_OPS.toString(), src);
+    assertConditionalCounter(CM_NUM_DST_OPS.toString(), dst);
+  }
+
+  /**
+   * Get the long metric for the given name using the provided getter,
+   * returning 0 if the metric does not exist.
+   * @param name The name of the metric to get
+   * @param metricGetter The function to get the metric value
+   * @return The value of the metric, or 0 if it does not exist
+   */
+  private long getLongMetric(String name,
+      BiFunction<String, MetricsRecordBuilder, Long> metricGetter) {
+    try {
+      return metricGetter.apply(name,
+          MetricsAsserts.getMetrics(MigrationMetrics.getName()));
+    } catch (AssertionError ae) {
+      return 0L;
+    }
+  }
+
+  /**
+   * Assert that the given gauge matches the expected value, or else
+   * treat the value as 0 if it does not exist.
+   * @param name The name of the gauge to assert
+   * @param expected The expected value of the gauge
+   */
+  private void assertConditionalGauge(String name, long expected) {
+    assertEquals(getLongMetric(name, MetricsAsserts::getLongGauge), expected);
+  }
+
+  /**
+   * Assert that the given counter matches the expected value, or else                                     
+   * treat the value as 0 if it does not exist.                                                            
+   * @param name The name of the counter to assert                                                         
+   * @param expected The expected value of the counter                                                     
+   */
+  private void assertConditionalCounter(String name, long expected) {
+    assertEquals(getLongMetric(name, MetricsAsserts::getLongCounter), expected);
+  }
+
+  /**
+   * Assert that the median of the given quantile metric matches the expected
+   * value. This sources data from the quantile object, not the metrics
+   * registry, to avoid interference with the timing of the quantile interval.
+   * This asserts that the metrics were collected correctly, not that they
+   * match the expected value in the registry.
+   * @param metric The quantile metric to test
+   * @param expected The expected median value
+   * @throws IOException If there is an error retrieving the metric
+   */
+  private void assertQuantileMedian(MigrationMetrics.QuantileMetric metric,
+      long expected) throws IOException {
+    // Quantile metrics are collected over an interval; to make this unit test
+    // independent of this interval timing, source the metrics from the quantile
+    // object, not the metrics registry
+    Assert.assertEquals(expected,
+        resolver.getMigrationMetrics().getQuantileMedian(metric));
+  }
+
+  private void assertQuantileMedian(MigrationMetrics.QuantileMetric metric,
+      Predicate<Long> asserPredicate) throws IOException {
+    long actual = resolver.getMigrationMetrics().getQuantileMedian(metric);
+    Assert.assertTrue(asserPredicate.test(actual));
   }
 }

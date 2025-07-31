@@ -1,0 +1,266 @@
+package org.apache.hadoop.hdfs.server.federation.metrics;
+
+import java.io.IOException;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Consumer;
+import javax.annotation.Nullable;
+import org.apache.hadoop.classification.VisibleForTesting;
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
+import org.apache.hadoop.metrics2.MetricsCollector;
+import org.apache.hadoop.metrics2.MetricsSource;
+import org.apache.hadoop.metrics2.MetricsSystem;
+import org.apache.hadoop.metrics2.annotation.Metrics;
+import org.apache.hadoop.metrics2.lib.DefaultMetricsSystem;
+import org.apache.hadoop.metrics2.lib.MetricsRegistry;
+import org.apache.hadoop.metrics2.lib.MutableCounterLong;
+import org.apache.hadoop.metrics2.lib.MutableGaugeLong;
+import org.apache.hadoop.metrics2.lib.MutableQuantiles;
+
+
+@Metrics(name="MigrationMetrics", about="Migration metrics", context="dfs")
+public class MigrationMetrics implements MetricsSource {
+
+  private static MetricsRegistry registry;
+  private final int[] quantileIntervals;
+
+  /**
+   * Create a new instance of MigrationMetrics and register it with the
+   * MetricsSystem. If an instance already exists, it will be unregistered
+   * and replaced with the new instance.
+   * @return the MigrationMetrics instance
+   */
+  public static MigrationMetrics create(Configuration conf) {
+    int[] quantileIntervals;
+    if (conf.getBoolean(RBFConfigKeys.MIGRATION_METRICS_QUANTILE_ENABLE,
+        false)) {
+      quantileIntervals =
+          conf.getInts(RBFConfigKeys.MIGRATION_METRICS_PERCENTILES_INTERVALS);
+    } else {
+      quantileIntervals = new int[0];
+    }
+    MetricsSystem ms = DefaultMetricsSystem.instance();
+    ms.unregisterSource(MigrationMetrics.class.getSimpleName());
+    return ms.register(MigrationMetrics.class.getSimpleName(),
+        "Migration metrics", new MigrationMetrics(quantileIntervals));
+  }
+
+  /**
+   * Get the name of the MigrationMetrics, useful for locating metrics in the
+   * MetricsSystem. This must match the name in the class annotation.
+   * @return the name of the MigrationMetrics
+   */
+  public static String getName() {
+    return MigrationMetrics.class.getSimpleName();
+  }
+
+  /**
+   * Private constructor to initialize the MigrationMetrics instance.
+   * Resets the registry and initializes gauge and counter metrics.
+   */
+  private MigrationMetrics(int[] quantileIntervals) {
+    this.quantileIntervals = quantileIntervals;
+    registry = new MetricsRegistry("router");
+    // Initialize gauge metrics
+    for (GaugeMetric metric : GaugeMetric.values()) {
+      gaugeMetricsMap.put(metric.metricName,
+          registry.newGauge(metric.metricName, metric.metricDesc, 0L));
+    }
+    // Initialize counter metrics
+    for (CounterMetric metric : CounterMetric.values()) {
+      counterMetricsMap.put(metric.metricName,
+          registry.newCounter(metric.metricName, metric.metricDesc, 0L));
+    }
+  }
+
+  @Override
+  public void getMetrics(MetricsCollector collector, boolean all) {
+    registry.snapshot(collector.addRecord(registry.info()), all);
+  }
+
+  /**
+   * Gauge Metrics
+   */
+  public enum GaugeMetric {
+    GM_NUM_ACTIVE_MIGRATIONS("MigrationNumActiveMigrations",
+        "Current number of migrations in progress");
+
+    private final String metricName;
+    private final String metricDesc;
+
+    GaugeMetric(String metricName, String metricDesc) {
+      this.metricName = metricName;
+      this.metricDesc = metricDesc;
+    }
+
+    @Override
+    public String toString() {
+      return metricName;
+    }
+  }
+
+  private final Map<String, MutableGaugeLong> gaugeMetricsMap =
+      new ConcurrentHashMap<>();
+
+  public void incrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
+    updateGaugeMetric(metric, MutableGaugeLong::incr, srcNs, dstNs);
+  }
+
+  public void decrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
+    updateGaugeMetric(metric, MutableGaugeLong::decr, srcNs, dstNs);
+  }
+
+  private void updateGaugeMetric(GaugeMetric metric,
+      Consumer<MutableGaugeLong> consumer, @Nullable String srcNs,
+      @Nullable String dstNs) {
+    consumer.accept(gaugeMetricsMap.computeIfAbsent(metric.metricName,
+        k -> registry.newGauge(metric.metricName, metric.metricDesc, 0L)));
+    if (srcNs != null && dstNs != null) {
+      String suffix = srcNs + "->" + dstNs;
+      String specificName = metric.metricName + "." + suffix;
+      consumer.accept(gaugeMetricsMap.computeIfAbsent(specificName,
+          k -> registry.newGauge(specificName,
+              metric.metricDesc + " on " + suffix, 0L)));
+    }
+  }
+
+  /**
+   * Counter Metrics
+   */
+  public enum CounterMetric {
+    CM_MISSING_PARENT_NUM_OPS("MigrationMissingParentNumOps",
+        "Number of migration ops which have missing parent dirs"),
+    CM_NUM_OPS("MigrationNumOps",
+        "Number of migration ops issued to migrating mount points"),
+    CM_NUM_SRC_OPS("MigrationSrcNumOps",
+        "Number of ops issued to the src of a migrating mount point"),
+    CM_NUM_DST_OPS("MigrationDstNumOps",
+        "Number of ops issued to the dst of a migrating mount point");
+
+    private final String metricName;
+    private final String metricDesc;
+
+    CounterMetric(String metricName, String metricDesc) {
+      this.metricName = metricName;
+      this.metricDesc = metricDesc;
+    }
+
+    @Override
+    public String toString() {
+      return metricName;
+    }
+  }
+
+  private final Map<String, MutableCounterLong> counterMetricsMap =
+      new ConcurrentHashMap<>();
+
+  public void incrCounterMetric(CounterMetric metric, String srcNs,
+      String dstNs) {
+    counterMetricsMap.computeIfAbsent(metric.metricName,
+            k -> registry.newCounter(metric.metricName, metric.metricDesc, 0L))
+        .incr();
+    if (srcNs != null && dstNs != null) {
+      String suffix = srcNs + "->" + dstNs;
+      String metricName = metric.metricName + "." + suffix;
+      counterMetricsMap.computeIfAbsent(metricName,
+          k -> registry.newCounter(metricName,
+              metric.metricDesc + " on " + suffix, 0L)).incr();
+    }
+  }
+
+  /**
+   * Quantile Metrics
+   */
+  public enum QuantileMetric {
+    QM_ROUTING_OPS("MigrationRouting",
+        "Internal ops issued to route migration ops", "Ops", "Num"),
+    QM_ROUTING_BATCHES("MigrationRoutingBatching",
+        "Batching of internal ops issued to route migration ops",
+        "Batches", "Num"),
+    QM_MISSING_PARENT_DETECTION_OPS("MigrationMissingParentDetection",
+        "Internal ops issued to detect missing parent dirs",
+        "Ops", "Num"),
+    QM_MISSING_PARENT_DETECTION_BATCHES(
+        "MigrationMissingParentDetectionBatching",
+        "Batching of internal ops issued to detect missing parent dirs",
+        "Batches", "Num"),
+    QM_MISSING_PARENT_CREATION_OPS("MigrationMissingParentCreation",
+        "Internal ops issued to create missing parent dirs",
+        "Ops", "Num"),
+    QM_MISSING_PARENT_CREATION_BATCHES(
+        "MigrationMissingParentCreationBatching",
+        "Batching of internal ops issued to create missing parent dirs",
+        "Batches", "Num"),
+    QM_MISSING_PARENT_DEPTH("MigrationMissingParentDepth",
+        "Parent dirs missing during migration ops", "Dirs", "Num");
+
+    private final String metricName;
+    private final String metricDesc;
+    private final String sampleName;
+    private final String valueName;
+
+    QuantileMetric(String metricName, String metricDesc, String sampleName,
+        String valueName) {
+      this.metricName = metricName;
+      this.metricDesc = metricDesc;
+      this.sampleName = sampleName;
+      this.valueName = valueName;
+    }
+
+    @Override
+    public String toString() {
+      return metricName;
+    }
+  }
+
+  private final Map<String, MutableQuantiles> quantileMetricsMap =
+      new ConcurrentHashMap<>();
+
+  public void addQuantileMetric(QuantileMetric metric, long value) {
+    addQuantileMetric(metric, value, null, null);
+  }
+
+  public void addQuantileMetric(QuantileMetric metric, long value,
+      String srcNs, String dstNs) {
+    for (int interval : quantileIntervals) {
+      String metricName = metric.metricName + interval + 's';
+      quantileMetricsMap.computeIfAbsent(metricName,
+          k -> registry.newQuantiles(metricName, metric.metricDesc,
+              metric.sampleName, metric.valueName, interval)).add(value);
+      if (srcNs != null && dstNs != null) {
+        String suffix = srcNs + "->" + dstNs;
+        String specificName = metricName + "." + suffix;
+        quantileMetricsMap.computeIfAbsent(specificName,
+            k -> registry.newQuantiles(specificName,
+                metric.metricDesc + " on " + suffix, metric.sampleName,
+                metric.valueName, interval)).add(value);
+      }
+    }
+  }
+
+  /**
+   * Get the median value for a given quantile metric. This directly exposes the
+   * 50th percentile value from the quantile metrics objects to avoid timing
+   * issues related to the collection interval.
+   * @param metric the quantile metric for which to retrieve the median
+   * @return the median value for the specified quantile metric
+   * @throws IOException if the metric is not enabled or not found
+   */
+  @VisibleForTesting
+  public long getQuantileMedian(QuantileMetric metric) throws IOException {
+    if (quantileIntervals.length == 0) {
+      throw new IOException("Quantile metrics are not enabled.");
+    }
+    int interval = quantileIntervals[0];
+    MutableQuantiles quantile =
+        quantileMetricsMap.get(metric.metricName + interval + 's');
+    if (quantile == null) {
+      // If the quantile metric is not found, no values have been added
+      return 0L;
+    }
+    return quantile.getEstimator()
+        .snapshot()
+        .get(MutableQuantiles.QUANTILES[0]);
+  }
+}

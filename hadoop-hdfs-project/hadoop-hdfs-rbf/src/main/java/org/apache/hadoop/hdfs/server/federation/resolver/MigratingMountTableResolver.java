@@ -9,6 +9,7 @@ import org.apache.commons.lang3.StringUtils;
 import org.apache.commons.lang3.tuple.Pair;
 import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.Options;
+import org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
@@ -45,6 +46,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.CounterMetric.*;
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.GaugeMetric.*;
+import static org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics.QuantileMetric.*;
 import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.*;
 
 
@@ -55,6 +59,7 @@ import static org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys.*;
 public class MigratingMountTableResolver extends MountTableResolver {
   private static final Logger LOG =
       LoggerFactory.getLogger(MigratingMountTableResolver.class);
+  private final Configuration conf;
   private RouterRpcServer rpcServer = null;
   private RouterRpcClient rpcClient = null;
 
@@ -86,6 +91,11 @@ public class MigratingMountTableResolver extends MountTableResolver {
   private static final Collection<String> nameServices = new HashSet<>();
 
   /**
+   * The migration metrics for the resolver.
+   */
+  private MigrationMetrics migrationMetrics;
+
+  /**
    * A type comparator to ensure files and directories are not compared.
    * Throws an IllegalArgumentException if a file is compared to a directory.
    */
@@ -111,6 +121,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
   public MigratingMountTableResolver(Configuration conf, Router routerService) {
     super(conf, routerService);
 
+    this.conf = conf;
+
     tempStagingSubdir = conf.get(DFS_ROUTER_MIGRATION_TEMP_STAGING_SUBDIR,
         DFS_ROUTER_MIGRATION_TEMP_STAGING_SUBDIR_DEFAULT);
     /*
@@ -127,6 +139,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
 
     nameServices.addAll(conf.getTrimmedStringCollection(DFS_NAMESERVICES));
     context = new MigrationContextCache();
+
+    migrationMetrics = MigrationMetrics.create(conf);
   }
 
   /**
@@ -267,18 +281,19 @@ public class MigratingMountTableResolver extends MountTableResolver {
   }
 
   /**
-   * Check if either of the mount tables is migrating.
+   * Check if either of the mount tables is migrating and migration is enabled
    * @param newEntry optional new mount table entry.
    * @param oldEntry optional old mount table entry.
    * @return true if either of the mount tables is migrating
    */
-  public static boolean isMigrating(@Nullable MountTable newEntry,
-      @Nullable MountTable oldEntry) {
+  public static boolean isMigrating(FileSubclusterResolver resolver,
+      @Nullable MountTable newEntry, @Nullable MountTable oldEntry) {
     MigratingMountPointInfo newMigrationInfo =
         newEntry == null ? null : newEntry.getMigratingMountPointInfo();
     MigratingMountPointInfo oldMigrationInfo =
         oldEntry == null ? null : oldEntry.getMigratingMountPointInfo();
-    return newMigrationInfo != null || oldMigrationInfo != null;
+    return resolver instanceof MigratingMountTableResolver &&
+        (newMigrationInfo != null || oldMigrationInfo != null);
   }
 
   /**
@@ -296,13 +311,12 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * @throws IllegalMigrationException if the mount table entry cannot be
    *         reconciled.
    */
-  public static MountTable reconcileEntryWithMigration(
-      MountTable newEntry, @Nullable MountTable oldEntry)
-      throws IllegalMigrationException {
+  public MountTable reconcileEntryWithMigration(@Nullable MountTable newEntry,
+      @Nullable MountTable oldEntry) throws IllegalMigrationException {
     // The MigratingMountPointInfo that is being set; if not set, this
     // implies a migration is being removed.
     MigratingMountPointInfo newMigrationInfo =
-        newEntry.getMigratingMountPointInfo();
+        newEntry == null ? null : newEntry.getMigratingMountPointInfo();
     // The MigratingMountPointInfo that was already set; if not set, this
     // implies a migration is being added.
     MigratingMountPointInfo oldMigrationInfo =
@@ -311,9 +325,11 @@ public class MigratingMountTableResolver extends MountTableResolver {
     // Only reconcile if mount table is already migrating or is about to start
     // migrating; if neither, this is a no-op.
     if (newMigrationInfo != null || oldMigrationInfo != null) {
-      Set<String> newNsIds = newEntry.getDestinations().stream()
-          .map(RemoteLocation::getNameserviceId)
-          .collect(Collectors.toSet());
+      Set<String> newNsIds = newEntry == null ? Collections.emptySet()
+          : newEntry.getDestinations()
+              .stream()
+              .map(RemoteLocation::getNameserviceId)
+              .collect(Collectors.toSet());
 
       // Determine the source and destination namespaces from the new migration
       // info if possible, else use the old migration info, else null
@@ -321,12 +337,14 @@ public class MigratingMountTableResolver extends MountTableResolver {
           newMigrationInfo.getSrcNs() : oldMigrationInfo.getSrcNs();
       String dstNsId = newMigrationInfo != null ?
           newMigrationInfo.getDstNs() : oldMigrationInfo.getDstNs();
+      String sourcePath = newEntry != null ? newEntry.getSourcePath()
+          : oldEntry.getSourcePath();
 
       // The source and destination can never be the same
       if (srcNsId.equals(dstNsId)) {
         throw new IllegalMigrationException(String.format("Migrating mount"
             + " table cannot have the same source and destination (%s->%s) for"
-            + " %s", srcNsId, dstNsId, newEntry.getSourcePath()));
+            + " %s", srcNsId, dstNsId, sourcePath));
       }
 
       // The mount table can only use namespaces that are migrating
@@ -334,7 +352,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         throw new IllegalMigrationException(String.format("Migrating mount"
             + " table must use only namespaces used in migration (%s->%s), but"
             + " encountered %s for %s", srcNsId, dstNsId, newNsIds,
-            newEntry.getSourcePath()));
+            sourcePath));
       }
 
       if (newMigrationInfo != null && oldMigrationInfo == null) {
@@ -342,45 +360,58 @@ public class MigratingMountTableResolver extends MountTableResolver {
         if (!newNsIds.contains(srcNsId)) {
           throw new IllegalMigrationException(String.format("Migrating mount"
               + " table must have the source namespace, but encountered %s for"
-              + " %s", newNsIds, newEntry.getSourcePath()));
+              + " %s", newNsIds, sourcePath));
         }
         if (newNsIds.size() == 1) {
           // If there is only one namespace, add the destination
           newNsIds.add(dstNsId);
         }
         LOG.info("Adding migration info ({} => {}->{}) for {}",
-            srcNsId, srcNsId, dstNsId, newEntry.getSourcePath());
+            srcNsId, srcNsId, dstNsId, sourcePath);
+        migrationMetrics.incrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS, srcNsId,
+            dstNsId);
       } else if (newMigrationInfo == null) {
         // Removing migration info, since the new mount point is not migrating
         if (newNsIds.size() > 1) {
           // If there are two namespaces, keep only the source
           newNsIds.remove(dstNsId);
         }
-        String newNsId = newNsIds.iterator().next();
+        String newNsId = newNsIds.isEmpty() ? null : newNsIds.iterator().next();
         LOG.info("Removing migration info ({}->{} => {}) for {}",
-            srcNsId, dstNsId, newNsId, newEntry.getSourcePath());
+            srcNsId, dstNsId, newNsId, sourcePath);
+        migrationMetrics.decrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS, srcNsId,
+            dstNsId);
       } else {
         // Updating migration info, since the new mount point is migrating and
         // the old mount point was already migrating
         if (!newNsIds.contains(srcNsId)) {
           throw new IllegalMigrationException(String.format("Migrating mount"
               + " table must have the source namespace, but encountered %s for"
-              + " %s", newNsIds, newEntry.getSourcePath()));
+              + " %s", newNsIds, sourcePath));
         }
         if (newNsIds.size() == 1) {
           // If there is only one namespace, add the destination
           newNsIds.add(dstNsId);
         }
         // Ensure that any changes to the migration info are valid
-        verifyMigrationUpdate(newMigrationInfo, oldMigrationInfo,
-            newEntry.getSourcePath());
-      }
+        verifyMigrationUpdate(newMigrationInfo, oldMigrationInfo, sourcePath);
 
-      if (newNsIds.isEmpty()) {
+        // If there are changes to the migration info, update metrics
+        if (!newMigrationInfo.equals(oldMigrationInfo)) {
+          migrationMetrics.incrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS,
+              newMigrationInfo.getSrcNs(), newMigrationInfo.getDstNs());
+          migrationMetrics.decrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS,
+              oldMigrationInfo.getSrcNs(), oldMigrationInfo.getDstNs());
+        }
+      }
+      
+      // Reconcile the entry locations to match the migration only if the mount
+      // point is not being removed
+      if (newEntry != null && newNsIds.isEmpty()) {
         throw new IllegalMigrationException(String.format("Migrating mount"
             + " table must have at least one destination, but encountered none"
-            + " for %s", newEntry.getSourcePath()));
-      } else {
+            + " for %s", sourcePath));
+      } else if (newEntry != null) {
         reconcileEntryLocations(newEntry, newNsIds);
       }
     }
@@ -397,7 +428,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * @param sourcePath the source path
    * @throws IllegalMigrationException if the migration update is illegal
    */
-  private static void verifyMigrationUpdate(
+  private void verifyMigrationUpdate(
       MigratingMountPointInfo newMigrationInfo,
       MigratingMountPointInfo oldMigrationInfo, String sourcePath)
       throws IllegalMigrationException {
@@ -431,7 +462,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * @throws IllegalMigrationException if the locations are inconsistent with
    *         the migration
    */
-  private static void reconcileEntryLocations(MountTable newEntry,
+  private void reconcileEntryLocations(MountTable newEntry,
       Set<String> nsIds) throws IllegalMigrationException {
     // If there are no configured namespaces, migration is disabled in config;
     // skip the check but allow manipulation of the mount table.
@@ -477,7 +508,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
       // There is no saved context if the mount point is not migrating or
       // if the migration behavior is not set.
       return super.getDestinationForPath(path);
-    } else {
+    }
+    try {
       MigrationPair<RemoteLocation> remoteLocations = getRemoteLocations(path);
       List<RemoteLocation> targetLocations;
       MigrationBehavior migrationBehavior = context.get().getMigrationBehavior();
@@ -518,7 +550,35 @@ public class MigratingMountTableResolver extends MountTableResolver {
           targetLocations.stream()
               .map(RemoteLocation::getNameserviceId)
               .collect(Collectors.joining(", ")), getUUID());
+      incrOpCounter(targetLocations, remoteLocations);
       return new PathLocation(path, targetLocations);
+    } finally {
+      // Update metrics
+      migrationMetrics.addQuantileMetric(QM_ROUTING_OPS,
+          context.getSubOpCount());
+      migrationMetrics.addQuantileMetric(QM_ROUTING_BATCHES,
+          context.getSubOpBatchCount());
+      context.resetOpCounts();
+    }
+  }
+
+  /**
+   * Increment the migration operation metrics counter for the src and/or dst
+   * @param targetLocations The target locations for the operation
+   * @param remoteLocations The source and destination remote locations
+   */
+  private void incrOpCounter(List<RemoteLocation> targetLocations,
+      MigrationPair<RemoteLocation> remoteLocations) {
+    String srcNs = remoteLocations.getSrc().getNameserviceId();
+    String dstNs = remoteLocations.getDst().getNameserviceId();
+    if (targetLocations.contains(remoteLocations.getSrc())) {
+      migrationMetrics.incrCounterMetric(CM_NUM_SRC_OPS, srcNs, dstNs);
+    }
+    if (targetLocations.contains(remoteLocations.getDst())) {
+      migrationMetrics.incrCounterMetric(CM_NUM_DST_OPS, srcNs, dstNs);
+    }
+    if (!targetLocations.isEmpty()) {
+      migrationMetrics.incrCounterMetric(CM_NUM_OPS, srcNs, dstNs);
     }
   }
 
@@ -645,6 +705,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
       String sourcePath = context.get()
           .getRemoteLocations(path.toUri().getPath())
           .getSourcePath();
+      MigratingMountPointInfo migratingMountPointInfo =
+          context.get().getMigratingMountPointInfo();
 
       // Build a list of all possible paths
       MigrationPairList<RemoteLocation> locations = new MigrationPairList<>();
@@ -658,51 +720,66 @@ public class MigratingMountTableResolver extends MountTableResolver {
         }
       }
 
-      // There is nothing to do if there are no locations under migration
-      if (locations.isEmpty()) {
-        return MigrationPairList.empty();
-      }
-
-      // If the source path is missing, skip it and only consider parents;
-      // else if the source path is a file, fail if it exists;
-      // else if the source path is a dir, consider it missing alongside parents
-      MigrationPair<RemoteLocation> pathLocations = locations.peekLast();
-      Map<RemoteLocation, HdfsFileStatus> pathResults =
-          getFileInfo(Collections.singletonList(pathLocations.getSrc()));
-      if (pathResults.get(pathLocations.getSrc()) == null) {
-        locations.removeLast();
-      } else if (!pathResults.get(pathLocations.getSrc()).isDirectory()) {
-        // Throw an error if the source file already exists
-        throw new IllegalMigrationException(String.format(
-            "Path %s is present on the source, so cannot be "
-                + "recreated on dst; call id %s", pathLocations.getSrc(),
-            getUUID()));
-      }
-
-      // Identify which source locations are present, short-circuiting on the
-      // first batch with a missing path
-      Map<RemoteLocation, HdfsFileStatus> existingSrcLocations =
-          getFileInfoShort(locations.getSrcList());
-
-      // Identify which destination locations are present, short-circuiting on the
-      // first batch with a missing path
-      Map<RemoteLocation, HdfsFileStatus> existingDstLocations =
-          getFileInfoShort(locations.getDstList());
-
-      // Identify locations present on the source and missing on the destination
       MigrationPairList<RemoteLocation> missingLocations =
-          new MigrationPairList<>();
-      for (MigrationPair<RemoteLocation> location : locations) {
-        RemoteLocation srcLocation = location.getSrc();
-        RemoteLocation dstLocation = location.getDst();
+          MigrationPairList.empty();
+      try {
+        // There is nothing to do if there are no locations under migration
+        if (!locations.isEmpty()) {
+          // If the source path is missing, skip it and only consider parents;
+          // else if the source path is a file, fail if it exists;
+          // else if the source path is a dir, consider it missing with parents
+          MigrationPair<RemoteLocation> pathLocations = locations.peekLast();
+          Map<RemoteLocation, HdfsFileStatus> pathResults =
+              getFileInfo(Collections.singletonList(pathLocations.getSrc()));
+          if (pathResults.get(pathLocations.getSrc()) == null) {
+            locations.removeLast();
+          } else if (!pathResults.get(pathLocations.getSrc()).isDirectory()) {
+            // Throw an error if the source file already exists
+            // (no parent directories are missing)
+            throw new IllegalMigrationException(String.format(
+                "Path %s is present on the source, so cannot be "
+                    + "recreated on dst; call id %s", pathLocations.getSrc(),
+                getUUID()));
+          }
 
-        if (existingSrcLocations.get(srcLocation) != null
-            && existingDstLocations.get(dstLocation) == null) {
-          missingLocations.add(location);
+          // Identify which source locations are present, short-circuiting on
+          // the first batch with a missing path
+          Map<RemoteLocation, HdfsFileStatus> existingSrcLocations =
+              getFileInfoShort(locations.getSrcList());
+
+          // Identify which destination locations are present, short-circuiting
+          // on the first batch with a missing path
+          Map<RemoteLocation, HdfsFileStatus> existingDstLocations =
+              getFileInfoShort(locations.getDstList());
+
+          // Identify locations present on the src and missing on the dst
+          missingLocations = new MigrationPairList<>();
+          for (MigrationPair<RemoteLocation> location : locations) {
+            RemoteLocation srcLocation = location.getSrc();
+            RemoteLocation dstLocation = location.getDst();
+
+            if (existingSrcLocations.get(srcLocation) != null
+                && existingDstLocations.get(dstLocation) == null) {
+              missingLocations.add(location);
+            }
+          }
         }
+        return missingLocations;
+      } finally {
+        // Update metrics
+        migrationMetrics.addQuantileMetric(QM_MISSING_PARENT_DEPTH,
+            missingLocations.size());
+        if (!missingLocations.isEmpty()) {
+          migrationMetrics.incrCounterMetric(CM_MISSING_PARENT_NUM_OPS,
+              migratingMountPointInfo.getSrcNs(),
+              migratingMountPointInfo.getDstNs());
+        }
+        migrationMetrics.addQuantileMetric(QM_MISSING_PARENT_DETECTION_OPS,
+            context.getSubOpCount());
+        migrationMetrics.addQuantileMetric(QM_MISSING_PARENT_DETECTION_BATCHES,
+            context.getSubOpBatchCount());
+        context.resetOpCounts();
       }
-
-      return missingLocations;
     }
 
     /**
@@ -712,23 +789,32 @@ public class MigratingMountTableResolver extends MountTableResolver {
      */
     private void copyMissingPathsFromSrc(
         MigrationPairList<RemoteLocation> missingPaths) throws IOException {
-      // The original path is the last path in the list of missing paths
-      String path = missingPaths.getLast().getPath(RemoteLocation::getSrc);
-      // The mount point root is saved as the path location's source path
-      String mpRoot = context.get().getRemoteLocations(path).getSourcePath();
-      // Use the destination location in the prefix for the missing paths
-      Path prefix = new Path(getMountPointTempPrefix(new Path(mpRoot)),
-          UUID.randomUUID().toString());
-      Map<RemoteLocation, AclStatus> aclStatusMap =
-          getAclStatuses(missingPaths.getSrcList());
-      // Copy all missing directories to the destination
-      for (RemoteLocation location : missingPaths.getSrcList()) {
-        copyDirectory(prefix, location.getSrc(), aclStatusMap.get(location));
+      try {
+        // The original path is the last path in the list of missing paths
+        String path = missingPaths.getLast().getPath(RemoteLocation::getSrc);
+        // The mount point root is saved as the path location's source path
+        String mpRoot = context.get().getRemoteLocations(path).getSourcePath();
+        // Use the destination location in the prefix for the missing paths
+        Path prefix = new Path(getMountPointTempPrefix(new Path(mpRoot)),
+            UUID.randomUUID().toString());
+        Map<RemoteLocation, AclStatus> aclStatusMap =
+            getAclStatuses(missingPaths.getSrcList());
+        // Copy all missing directories to the destination
+        for (RemoteLocation location : missingPaths.getSrcList()) {
+          copyDirectory(prefix, location.getSrc(), aclStatusMap.get(location));
+        }
+        // Commit all missing directories to the final location on the
+        // destination, starting with the highest missing path
+        commitDirectories(prefix, missingPaths);
+        cleanupTmpDirectories(prefix);
+      } finally {
+        // Update metrics
+        migrationMetrics.addQuantileMetric(QM_MISSING_PARENT_CREATION_OPS,
+            context.getSubOpCount());
+        migrationMetrics.addQuantileMetric(QM_MISSING_PARENT_CREATION_BATCHES,
+            context.getSubOpBatchCount());
+        context.resetOpCounts();
       }
-      // Commit all missing directories to the final location on the
-      // destination, starting with the highest missing path
-      commitDirectories(prefix, missingPaths);
-      cleanupTmpDirectories(prefix);
     }
 
     /**
@@ -904,7 +990,9 @@ public class MigratingMountTableResolver extends MountTableResolver {
       while (iter.hasNext() && ((maxBatchSize <= 0) || (batch.size()
           < maxBatchSize))) {
         batch.add(iter.next());
+        context.incrSubOpCount();
       }
+      context.incrSubOpBatchCount();
       List<RemoteResult<RemoteLocation, T>> batchResults =
           rpcClient.invokeConcurrent(batch, method, false, -1, clazz);
       // Tracks whether a short-circuit is in progress
@@ -952,6 +1040,8 @@ public class MigratingMountTableResolver extends MountTableResolver {
    */
   private <T> T callNamenode(MigrationBehavior overrideBehavior,
       RemoteMethodSupplier<T> supplier) throws IOException {
+    context.incrSubOpCount();
+    context.incrSubOpBatchCount();
     return context.overrideBehavior(overrideBehavior, supplier);
   }
 
@@ -969,6 +1059,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
   private void callNamenode(MigrationBehavior overrideBehavior,
       RemoteMethodRunnable runnable) throws IOException {
     callNamenode(overrideBehavior, () -> {
+      // Metrics are tracked through overloaded method
       runnable.run();
       return null; // void return type
     });
@@ -1007,6 +1098,16 @@ public class MigratingMountTableResolver extends MountTableResolver {
       return new UUID(RPC.Server.getCallId(),
           RPC.Server.getCurCall().get().getTimestampNanos());
     }
+  }
+
+  @VisibleForTesting
+  public void resetMigrationMetrics() {
+    migrationMetrics = MigrationMetrics.create(conf);
+  }
+
+  @VisibleForTesting
+  public MigrationMetrics getMigrationMetrics() {
+    return migrationMetrics;
   }
 
   private static class MigrationPairList<T>
@@ -1221,6 +1322,61 @@ public class MigratingMountTableResolver extends MountTableResolver {
     }
 
     /**
+     * Increment the number of sub ops for the current migration.
+     */
+    public void incrSubOpCount() throws IllegalMigrationException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry != null) {
+        contextEntry.subOpCount++;
+      }
+    }
+
+    /**
+     * Get the number of sub ops for the current migration.
+     * @return The number of sub ops for the current migration
+     */
+    public int getSubOpCount() throws IllegalMigrationException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry != null) {
+        return contextEntry.subOpCount;
+      }
+      return 0;
+    }
+
+    /**
+     * Increment the number of sub op batches for the current migration.
+     */
+    public void incrSubOpBatchCount() throws IllegalMigrationException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry != null) {
+        contextEntry.subOpBatchCount++;
+      }
+    }
+
+    /**
+     * Get the number of sub op batches for the current migration.
+     * @return The number of sub op batches for the current migration
+     */
+    public int getSubOpBatchCount() throws IllegalMigrationException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry != null) {
+        return contextEntry.subOpBatchCount;
+      }
+      return 0;
+    }
+
+    /**
+     * Reset the sub op counts for the current migration.
+     */
+    public void resetOpCounts() throws IllegalMigrationException {
+      MigrationContextEntry contextEntry = get();
+      if (contextEntry != null) {
+        contextEntry.subOpCount = 0;
+        contextEntry.subOpBatchCount = 0;
+      }
+    }
+
+    /**
      * The inner context object, accessed via MigrationContextCache.
      * All fields are immutable except overrideLocations.
      */
@@ -1229,6 +1385,9 @@ public class MigratingMountTableResolver extends MountTableResolver {
       private final MigratingMountPointInfo migratingMountPointInfo;
       private final PathLocation defaultLocation;
       private MigrationBehavior overrideBehavior;
+
+      private int subOpCount = 0;
+      private int subOpBatchCount = 0;
 
       public MigrationContextEntry(MigrationBehavior migrationBehavior,
           String path) throws IOException {

@@ -285,12 +285,12 @@ public class RouterAdminServer extends AbstractService
   @Override
   public AddMountTableEntryResponse addMountTableEntry(
       AddMountTableEntryRequest request) throws IOException {
-    if (this.router.getSubclusterResolver() instanceof MountTableResolver) {
-      if (MigratingMountTableResolver.isMigrating(request.getEntry(), null)) {
-        request.setEntry(
-            MigratingMountTableResolver.reconcileEntryWithMigration(
-                request.getEntry(), null));
-      }
+    if (MigratingMountTableResolver.isMigrating(
+        this.router.getSubclusterResolver(), request.getEntry(), null)) {
+      // If the mount table entry is migrating, reconcile the new entry
+      request.setEntry(
+          ((MigratingMountTableResolver) this.router.getSubclusterResolver())
+              .reconcileEntryWithMigration(request.getEntry(), null));
     }
     return getMountTableStore().addMountTableEntry(request);
   }
@@ -305,10 +305,12 @@ public class RouterAdminServer extends AbstractService
           (MountTableResolver) this.router.getSubclusterResolver();
       oldEntry = mResolver.getMountPoint(updateEntry.getSourcePath());
 
-      if (MigratingMountTableResolver.isMigrating(updateEntry, oldEntry)) {
+      if (MigratingMountTableResolver.isMigrating(
+          this.router.getSubclusterResolver(), request.getEntry(), null)) {
+        // If the mount table entry is migrating, reconcile the new entry
         request.setEntry(
-            MigratingMountTableResolver.reconcileEntryWithMigration(updateEntry,
-                oldEntry));
+            ((MigratingMountTableResolver) this.router.getSubclusterResolver())
+                .reconcileEntryWithMigration(request.getEntry(), oldEntry));
       }
     }
     UpdateMountTableEntryResponse response = getMountTableStore()
@@ -427,6 +429,17 @@ public class RouterAdminServer extends AbstractService
       // if the actual destination doesn't exist.
       LOG.warn("Unable to clear quota at the destinations for {}: {}",
           request.getSrcPath(), e.getMessage());
+    }
+    if (this.router.getSubclusterResolver() instanceof MountTableResolver) {
+      MountTable mountTable =
+          ((MountTableResolver) this.router.getSubclusterResolver())
+          .getMountPoint(request.getSrcPath());
+      if (MigratingMountTableResolver.isMigrating(
+          this.router.getSubclusterResolver(), null, mountTable)) {
+        // If the mount table entry is migrating, reconcile the old mount table
+        ((MigratingMountTableResolver) this.router.getSubclusterResolver())
+            .reconcileEntryWithMigration(null, mountTable);
+      }
     }
     return getMountTableStore().removeMountTableEntry(request);
   }

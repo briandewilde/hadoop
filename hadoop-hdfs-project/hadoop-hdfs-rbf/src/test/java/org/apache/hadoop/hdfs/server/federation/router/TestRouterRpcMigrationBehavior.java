@@ -34,7 +34,6 @@ import org.apache.hadoop.hdfs.server.federation.resolver.IllegalMigrationExcepti
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableManager;
-import org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.RemoveMountTableEntryRequest;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.UpdateMountTableEntryRequest;
@@ -80,7 +79,7 @@ import static org.mockito.Mockito.*;
 public class TestRouterRpcMigrationBehavior {
   private static StateStoreDFSCluster cluster;
   private static MiniRouterDFSCluster.RouterContext routerContext;
-  private static MountTableResolver resolver;
+  private static MigratingMountTableResolver resolver;
   private static DistributedFileSystem nnFs0;
   private static DistributedFileSystem nnFs1;
   private static DistributedFileSystem routerFs;
@@ -112,8 +111,8 @@ public class TestRouterRpcMigrationBehavior {
     cluster.waitClusterUp();
 
     routerContext = cluster.getRandomRouter();
-    resolver =
-        (MountTableResolver) routerContext.getRouter().getSubclusterResolver();
+    resolver = (MigratingMountTableResolver) routerContext.getRouter()
+        .getSubclusterResolver();
     nnFs0 = (DistributedFileSystem) cluster
         .getNamenode(cluster.getNameservices().get(0), null).getFileSystem();
     nnFs1 = (DistributedFileSystem) cluster
@@ -138,9 +137,8 @@ public class TestRouterRpcMigrationBehavior {
         RemoveMountTableEntryRequest.newInstance(sourcePath.toString());
     mountTableManager.removeMountTableEntry(request);
     cluster.deleteAllFiles();
-    MigratingMountTableResolver resolver =
-        (MigratingMountTableResolver) routerContext.getRouter()
-            .getSubclusterResolver();
+    // Reload the cache to avoid propagation delays via cache update
+    resolver.loadCache(true);
   }
   
   private MountTable setupMountTable() throws IOException {
@@ -265,7 +263,7 @@ public class TestRouterRpcMigrationBehavior {
     // Use an unusual permission to ensure it is set on the destination
     nnFs0.setPermission(parent, FsPermission.valueOf("-rw-rw-rwx"));
     nnFs0.setXAttr(parent, "user.a1", "v1".getBytes());
-    
+
     // Create file on destination to trigger parent directory creation
     createFileWithoutParents(routerFs, path.toString());
 
@@ -300,8 +298,7 @@ public class TestRouterRpcMigrationBehavior {
         nnFs1.getFileStatus(parent));
     
     // Verify that all op-level tmp objects are deleted
-    Path tmp = ((MigratingMountTableResolver) resolver).getMountPointTempPrefix(
-        sourcePath);
+    Path tmp = resolver.getMountPointTempPrefix(sourcePath);
     assertEquals(0, nnFs1.listStatus(tmp).length);
   }
 
@@ -343,8 +340,7 @@ public class TestRouterRpcMigrationBehavior {
     }
 
     // Verify that all op-level tmp objects are deleted
-    Path tmp = ((MigratingMountTableResolver) resolver).getMountPointTempPrefix(
-        sourcePath);
+    Path tmp = resolver.getMountPointTempPrefix(sourcePath);
     assertEquals(0, nnFs1.listStatus(tmp).length);
   }
   

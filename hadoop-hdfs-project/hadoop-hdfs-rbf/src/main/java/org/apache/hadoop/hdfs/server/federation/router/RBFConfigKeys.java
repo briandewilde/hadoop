@@ -329,4 +329,8 @@ public class RBFConfigKeys extends CommonConfigurationKeysPublic {
       FEDERATION_ROUTER_PREFIX + "migration.batch.size";
   public static final String
       DFS_ROUTER_MIGRATION_TEMP_STAGING_SUBDIR_DEFAULT = "tmp/migration";
+  public static final String MIGRATION_METRICS_QUANTILE_ENABLE =
+      FEDERATION_ROUTER_PREFIX + "migration.metrics.quantile.enable";
+  public static final String  MIGRATION_METRICS_PERCENTILES_INTERVALS =
+      FEDERATION_ROUTER_PREFIX +  "migration.metrics.percentiles.intervals";
 }
