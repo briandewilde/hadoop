@@ -161,7 +161,7 @@ public class TestMigratingMountTableResolver {
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
   }
 
   @Test
@@ -175,7 +175,7 @@ public class TestMigratingMountTableResolver {
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
   }
 
   @Test
@@ -224,7 +224,7 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are updated for the migration
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -245,8 +245,8 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are updated for original and rollback migrations
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns1->ns0", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns1-ns0", 1L);
   }
 
   @Test
@@ -295,7 +295,7 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are set
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns0", path);
@@ -309,7 +309,7 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are reset
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 0L);
   }
 
   @Test
@@ -322,7 +322,7 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are set
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
 
     Map<String, String> destMap = new HashMap<>();
     destMap.put("ns1", path);
@@ -336,7 +336,7 @@ public class TestMigratingMountTableResolver {
 
     // Assert metrics are reset
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
-    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0->ns1", 0L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 0L);
   }
 
   @Test
@@ -738,7 +738,7 @@ public class TestMigratingMountTableResolver {
     // Assert that no dirs are listed as missing due to short-circuit
     assertQuantileMedian(QM_MISSING_PARENT_DEPTH, 0L);
     assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 0L);
-    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0-ns1", 0L);
   }
 
   @Test
@@ -766,7 +766,7 @@ public class TestMigratingMountTableResolver {
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, n -> n > 0L);
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, n -> n > 0L);
     assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 1L);
-    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 1L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0-ns1", 1L);
   }
 
   @Test
@@ -794,7 +794,7 @@ public class TestMigratingMountTableResolver {
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, n -> n > 0L);
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, n -> n > 0L);
     assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 1L);
-    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 1L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0-ns1", 1L);
   }
 
   @Test
@@ -823,7 +823,7 @@ public class TestMigratingMountTableResolver {
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_OPS, 0L);
     assertQuantileMedian(QM_MISSING_PARENT_CREATION_BATCHES, 0L);
     assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS.toString(), 0L);
-    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0->ns1", 0L);
+    assertConditionalCounter(CM_MISSING_PARENT_NUM_OPS + ".ns0-ns1", 0L);
   }
 
   @Ignore

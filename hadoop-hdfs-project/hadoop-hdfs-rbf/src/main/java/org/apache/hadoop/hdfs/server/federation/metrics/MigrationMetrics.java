@@ -21,8 +21,7 @@ import org.apache.hadoop.metrics2.lib.MutableQuantiles;
 
 @Metrics(name="MigrationMetrics", about="Migration metrics", context="dfs")
 public class MigrationMetrics implements MetricsSource {
-
-  private static MetricsRegistry registry;
+  private final MetricsRegistry registry;
   private final int[] quantileIntervals;
 
   /**
@@ -79,6 +78,11 @@ public class MigrationMetrics implements MetricsSource {
     registry.snapshot(collector.addRecord(registry.info()), all);
   }
 
+  @VisibleForTesting
+  public MetricsRegistry getRegistry() {
+    return registry;
+  }
+
   /**
    * Gauge Metrics
    */
@@ -103,25 +107,44 @@ public class MigrationMetrics implements MetricsSource {
   private final Map<String, MutableGaugeLong> gaugeMetricsMap =
       new ConcurrentHashMap<>();
 
+  /**
+   * Increment a gauge metric by 1.
+   * @param metric the gauge metric to update
+   * @param srcNs the source namespace, can be null
+   * @param dstNs the destination namespace, can be null
+   */
   public void incrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
     updateGaugeMetric(metric, MutableGaugeLong::incr, srcNs, dstNs);
   }
 
+  /**
+   * Decrement a gauge metric by 1.
+   * @param metric the gauge metric to update
+   * @param srcNs the source namespace, can be null
+   * @param dstNs the destination namespace, can be null
+   */
   public void decrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
     updateGaugeMetric(metric, MutableGaugeLong::decr, srcNs, dstNs);
   }
 
+  /**
+   * Update a gauge metric using the provided consumer function.
+   * @param metric the gauge metric to update
+   * @param consumer the consumer function to apply to the gauge
+   * @param srcNs the source namespace, can be null
+   * @param dstNs the destination namespace, can be null
+   */
   private void updateGaugeMetric(GaugeMetric metric,
       Consumer<MutableGaugeLong> consumer, @Nullable String srcNs,
       @Nullable String dstNs) {
     consumer.accept(gaugeMetricsMap.computeIfAbsent(metric.metricName,
         k -> registry.newGauge(metric.metricName, metric.metricDesc, 0L)));
     if (srcNs != null && dstNs != null) {
-      String suffix = srcNs + "->" + dstNs;
-      String specificName = metric.metricName + "." + suffix;
+      String specificName =
+          buildSpecificMetricName(metric.metricName, srcNs, dstNs);
       consumer.accept(gaugeMetricsMap.computeIfAbsent(specificName,
           k -> registry.newGauge(specificName,
-              metric.metricDesc + " on " + suffix, 0L)));
+              buildSpecificMetricDesc(metric.metricName, srcNs, dstNs), 0L)));
     }
   }
 
@@ -155,17 +178,24 @@ public class MigrationMetrics implements MetricsSource {
   private final Map<String, MutableCounterLong> counterMetricsMap =
       new ConcurrentHashMap<>();
 
+  /**
+   * Increment a counter metric by 1.
+   * @param metric the counter metric to update
+   * @param srcNs the source namespace, can be null
+   * @param dstNs the destination namespace, can be null
+   */
   public void incrCounterMetric(CounterMetric metric, String srcNs,
       String dstNs) {
     counterMetricsMap.computeIfAbsent(metric.metricName,
-            k -> registry.newCounter(metric.metricName, metric.metricDesc, 0L))
+        k -> registry.newCounter(metric.metricName, metric.metricDesc, 0L))
         .incr();
     if (srcNs != null && dstNs != null) {
-      String suffix = srcNs + "->" + dstNs;
-      String metricName = metric.metricName + "." + suffix;
-      counterMetricsMap.computeIfAbsent(metricName,
-          k -> registry.newCounter(metricName,
-              metric.metricDesc + " on " + suffix, 0L)).incr();
+      String specificName =
+          buildSpecificMetricName(metric.metricName, srcNs, dstNs);
+      counterMetricsMap.computeIfAbsent(specificName,
+          k -> registry.newCounter(specificName,
+              buildSpecificMetricDesc(metric.metricName, srcNs, dstNs), 0L))
+          .incr();
     }
   }
 
@@ -217,10 +247,22 @@ public class MigrationMetrics implements MetricsSource {
   private final Map<String, MutableQuantiles> quantileMetricsMap =
       new ConcurrentHashMap<>();
 
+  /**
+   * Add a quantile metric with a value.
+   * @param metric the quantile metric to add
+   * @param value the value to add to the quantile metric
+   */
   public void addQuantileMetric(QuantileMetric metric, long value) {
     addQuantileMetric(metric, value, null, null);
   }
 
+  /**
+   * Add a quantile metric with a value, specifying source and destination
+   * @param metric the quantile metric to add
+   * @param value the value to add to the quantile metric
+   * @param srcNs the source namespace, can be null
+   * @param dstNs the destination namespace, can be null
+   */
   public void addQuantileMetric(QuantileMetric metric, long value,
       String srcNs, String dstNs) {
     for (int interval : quantileIntervals) {
@@ -229,12 +271,11 @@ public class MigrationMetrics implements MetricsSource {
           k -> registry.newQuantiles(metricName, metric.metricDesc,
               metric.sampleName, metric.valueName, interval)).add(value);
       if (srcNs != null && dstNs != null) {
-        String suffix = srcNs + "->" + dstNs;
-        String specificName = metricName + "." + suffix;
+        String specificName = buildSpecificMetricName(metricName, srcNs, dstNs);
         quantileMetricsMap.computeIfAbsent(specificName,
             k -> registry.newQuantiles(specificName,
-                metric.metricDesc + " on " + suffix, metric.sampleName,
-                metric.valueName, interval)).add(value);
+                buildSpecificMetricDesc(metricName, srcNs, dstNs),
+                metric.sampleName, metric.valueName, interval)).add(value);
       }
     }
   }
@@ -262,5 +303,31 @@ public class MigrationMetrics implements MetricsSource {
     return quantile.getEstimator()
         .snapshot()
         .get(MutableQuantiles.QUANTILES[0]);
+  }
+
+  /**
+   * Build a specific metric name based on the provided metric name and the
+   * source and destination namespaces.
+   * @param metricName the base metric name
+   * @param srcNs the source namespace
+   * @param dstNs the destination namespace
+   * @return the specific metric name
+   */
+  private String buildSpecificMetricName(String metricName, String srcNs,
+      String dstNs) {
+    return metricName + "." + srcNs + "-" + dstNs;
+  }
+
+  /**
+   * Build a specific metric description based on the provided metric and the
+   * source and destination namespaces.
+   * @param metricDesc the base metric description
+   * @param srcNs the source namespace
+   * @param dstNs the destination namespace
+   * @return the specific metric description
+   */
+  private String buildSpecificMetricDesc(String metricDesc, String srcNs,
+      String dstNs) {
+    return metricDesc + " on " + srcNs + "-" + dstNs;
   }
 }

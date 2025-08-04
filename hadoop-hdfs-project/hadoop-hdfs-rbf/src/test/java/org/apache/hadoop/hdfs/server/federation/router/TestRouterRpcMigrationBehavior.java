@@ -30,6 +30,7 @@ import org.apache.hadoop.hdfs.protocol.HdfsFileStatus;
 import org.apache.hadoop.hdfs.server.federation.MiniRouterDFSCluster;
 import org.apache.hadoop.hdfs.server.federation.RouterConfigBuilder;
 import org.apache.hadoop.hdfs.server.federation.StateStoreDFSCluster;
+import org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics;
 import org.apache.hadoop.hdfs.server.federation.resolver.IllegalMigrationException;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
@@ -58,9 +59,11 @@ import org.apache.hadoop.hdfs.web.resources.UserParam;
 import org.apache.hadoop.hdfs.web.resources.XAttrEncodingParam;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
+import org.apache.hadoop.metrics2.lib.MetricsRegistry;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.junit.After;
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -127,6 +130,13 @@ public class TestRouterRpcMigrationBehavior {
       cluster.shutdown();
       cluster = null;
     }
+  }
+
+  @Before
+  public void setupTestEnvironment() {
+    // Reset migration metrics at the beginning of each test to mitigate timing
+    // issues with the metrics collection
+    resolver.resetMigrationMetrics();
   }
 
   @After
@@ -639,6 +649,48 @@ public class TestRouterRpcMigrationBehavior {
     assertThrows(AssertionError.class,
         () -> getDoubleGauge("NonMigratingSetPermissionAvgTime",
             rpcDetailedMetrics));
+  }
+
+  /**
+   * Test that migration metrics are updated correctly when a migration starts
+   * or ends. This ensures the RouterAdminClient correctly updates the migration
+   * metrics. It requires manually fetching the migration metrics to avoid
+   * timing windows due to lazy fetching.
+   * @throws IOException If an error occurs
+   */
+  @Test
+  public void testMigrationMetrics() throws IOException {
+    MetricsRegistry metricsRegistry =
+        resolver.getMigrationMetrics().getRegistry();
+    setupMountTable();
+    {
+      // Update metrics and ensure they are initialized to 0 without migration
+      MetricsRecordBuilder rb = getMetrics(MigrationMetrics.getName());
+      metricsRegistry.snapshot(rb, false);
+      assertGauge(
+          MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L,
+          rb);
+    }
+
+    setupMountTableForMigration();
+    {
+      // Update metrics and ensure they are incremented to 1 with migration
+      MetricsRecordBuilder rb = getMetrics(MigrationMetrics.getName());
+      metricsRegistry.snapshot(rb, false);
+      assertGauge(
+          MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L,
+          rb);
+    }
+
+    setupMountTable();
+    {
+      // Update metrics and ensure they are reset to 0 without migration
+      MetricsRecordBuilder rb = getMetrics(MigrationMetrics.getName());
+      metricsRegistry.snapshot(rb, false);
+      assertGauge(
+          MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L,
+          rb);
+    }
   }
 
   /**

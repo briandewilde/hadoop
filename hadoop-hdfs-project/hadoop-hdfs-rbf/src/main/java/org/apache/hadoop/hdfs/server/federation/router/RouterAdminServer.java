@@ -306,7 +306,7 @@ public class RouterAdminServer extends AbstractService
       oldEntry = mResolver.getMountPoint(updateEntry.getSourcePath());
 
       if (MigratingMountTableResolver.isMigrating(
-          this.router.getSubclusterResolver(), request.getEntry(), null)) {
+          this.router.getSubclusterResolver(), request.getEntry(), oldEntry)) {
         // If the mount table entry is migrating, reconcile the new entry
         request.setEntry(
             ((MigratingMountTableResolver) this.router.getSubclusterResolver())
