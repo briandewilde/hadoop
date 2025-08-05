@@ -27,6 +27,7 @@ import org.apache.hadoop.hdfs.server.federation.store.records.MountTable;
 import org.apache.hadoop.ipc.RPC;
 import org.apache.hadoop.ipc.Server;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.test.MetricsAsserts;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ArrayListMultimap;
 import org.apache.hadoop.thirdparty.com.google.common.collect.ImmutableMap;
@@ -87,7 +88,11 @@ public class TestMigratingMountTableResolver {
     resolver = new MigratingMountTableResolver(conf, null);
     rpcServerMock = mock(RouterRpcServer.class);
     rpcClientMock = mock(RouterRpcClient.class);
-    when(rpcServerMock.getRPCClient()).thenReturn(rpcClientMock);
+    doReturn(rpcClientMock).when(rpcServerMock).getRPCClient();
+    doAnswer(i ->
+        ((RouterRpcServer.SupplierWithIOException<?>) i.getArgument(1)).get())
+        .when(rpcServerMock).overrideUser(any(UserGroupInformation.class),
+            any(RouterRpcServer.SupplierWithIOException.class));
     resolver.setRpcServer(rpcServerMock);
     // Set the RPC call ID to 1 to simulate an RPC call
     RPC.Server.getCurCall()

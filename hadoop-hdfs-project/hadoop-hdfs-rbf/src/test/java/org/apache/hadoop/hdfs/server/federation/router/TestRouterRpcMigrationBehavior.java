@@ -6,6 +6,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
+import java.security.PrivilegedExceptionAction;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumSet;
@@ -20,7 +21,9 @@ import org.apache.hadoop.fs.CreateFlag;
 import org.apache.hadoop.fs.FSDataInputStream;
 import org.apache.hadoop.fs.FSDataOutputStream;
 import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
+import org.apache.hadoop.fs.permission.FsAction;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.DFSOutputStream;
@@ -60,6 +63,7 @@ import org.apache.hadoop.hdfs.web.resources.XAttrEncodingParam;
 import org.apache.hadoop.ipc.RemoteException;
 import org.apache.hadoop.metrics2.MetricsRecordBuilder;
 import org.apache.hadoop.metrics2.lib.MetricsRegistry;
+import org.apache.hadoop.security.AccessControlException;
 import org.apache.hadoop.security.UserGroupInformation;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -141,6 +145,7 @@ public class TestRouterRpcMigrationBehavior {
 
   @After
   public void resetTestEnvironment() throws IOException {
+    UserGroupInformation.reset();
     RouterClient client = routerContext.getAdminClient();
     MountTableManager mountTableManager = client.getMountTableManager();
     RemoveMountTableEntryRequest request =
@@ -691,6 +696,86 @@ public class TestRouterRpcMigrationBehavior {
           MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L,
           rb);
     }
+  }
+
+  /**
+   * Test that users with restricted permissions can still create and access
+   * files, including creating missing directories
+   * @throws Exception If an error occurs
+   */
+  @Test
+  public void testMissingDirCreationWithRestrictedPermissions()
+      throws Exception {
+    setupMountTableForMigration();
+
+    String owner = "owner";
+    String group = "group";
+
+    // Create two users of different restrictions
+    UserGroupInformation groupUser =
+        UserGroupInformation.createUserForTesting("groupUser",
+            new String[]{group});
+    UserGroupInformation worldUser =
+        UserGroupInformation.createUserForTesting("worldUser",
+            new String[]{});
+
+    // Create an ancestor directory with group and world traversal permission
+    Path ancestor = new Path(sourcePath, "ancestor");
+    nnFs0.mkdirs(ancestor);
+    nnFs0.setPermission(ancestor, new FsPermission(
+        FsAction.ALL, FsAction.EXECUTE, FsAction.EXECUTE));
+    nnFs0.setOwner(ancestor, owner, group);
+
+    // Create a parent directory with group write and world none permission
+    Path parent = new Path(ancestor, "parent");
+    nnFs0.mkdirs(parent);
+    nnFs0.setPermission(parent, new FsPermission(
+        FsAction.ALL, FsAction.WRITE_EXECUTE, FsAction.EXECUTE));
+    nnFs0.setOwner(parent, owner, group);
+
+    // Designate a path to a file, but do not create it yet
+    Path filePath = new Path(parent, "file");
+
+    // Assert a world user cannot create a file in the parent directory.
+    // However, this will trigger creation of missing parent directories.
+    try (FileSystem worldFs = getFileSystemForUser(worldUser)) {
+      assertThrows(AccessControlException.class,
+          () -> worldFs.create(filePath));
+    }
+
+    // Create the file as the group user.
+    try (FileSystem groupFs = getFileSystemForUser(groupUser)) {
+      // Assert that the group user can create a file in the parent directory
+      groupFs.create(filePath);
+    }
+    // Assert that the parent/ancestor permissions match the source
+    assertEquals(nnFs0.getFileStatus(parent).getPermission(),
+        nnFs1.getFileStatus(parent).getPermission());
+    assertEquals(nnFs0.getFileStatus(ancestor).getPermission(),
+        nnFs1.getFileStatus(ancestor).getPermission());
+    // Update the permissions on the new file (using the namenode)
+    nnFs1.setPermission(filePath, new FsPermission(
+        FsAction.ALL, FsAction.ALL, FsAction.ALL));
+
+    // Assert that the world user can read the file
+    try (FileSystem worldFs = getFileSystemForUser(worldUser)) {
+      assertTrue(worldFs.exists(filePath));
+    }
+  }
+
+  /**
+   * Get a FileSystem for a specific user
+   * @param ugi UserGroupInformation for the user
+   * @return FileSystem for the user
+   * @throws Exception If an error occurs
+   */
+  private FileSystem getFileSystemForUser(UserGroupInformation ugi)
+      throws Exception {
+    return ugi.doAs((PrivilegedExceptionAction<FileSystem>) () -> {
+      Configuration conf = new Configuration();
+      conf.set("fs.defaultFS", routerContext.getFileSystemURI().toString());
+      return FileSystem.get(conf);
+    });
   }
 
   /**

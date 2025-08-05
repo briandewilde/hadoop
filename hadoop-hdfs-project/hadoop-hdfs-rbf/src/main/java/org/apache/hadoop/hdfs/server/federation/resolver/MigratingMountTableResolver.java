@@ -11,6 +11,7 @@ import org.apache.hadoop.fs.FileAlreadyExistsException;
 import org.apache.hadoop.fs.Options;
 import org.apache.hadoop.hdfs.server.federation.metrics.MigrationMetrics;
 import org.apache.hadoop.ipc.Server;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.hadoop.thirdparty.com.google.common.annotations.VisibleForTesting;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -267,11 +268,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
       if (migrationBehavior == MigrationBehavior.DST_ONLY) {
         // Since the context is not already set, it is safe to create missing
         // paths here; otherwise assume missing paths are already created
-        MigrationPairList<RemoteLocation> missingPaths =
-            missingPathHandler.getMissingParentPaths(new Path(path));
-        if (!missingPaths.isEmpty()) {
-          missingPathHandler.copyMissingPathsFromSrc(missingPaths);
-        }
+        missingPathHandler.createMissingDstDirsIfAbsent(path);
       }
     } else if (call != null) {
       // If there is an associated RPC call, add a non-migrating metrics alias
@@ -521,7 +518,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
         case DST_ONLY:
           // A check whether the path exists on the source subcluster has
           // already been performed as part of the missing paths check;
-          // see pathPresenceCache#getMissingParentDirectories.
+          // see MissingPathHandler#getMissingParentPaths.
           targetLocations =
               Collections.singletonList(remoteLocations.getDst());
           break;
@@ -694,6 +691,23 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * missing on the destination.
    */
   private class MissingPathHandler {
+    /**
+     * Create missing parent directories on the destination if they are absent.
+     * This should serve as the entry point to MissingPathHandler.
+     * @param path The path for which to create missing parent directories
+     * @throws IOException If an error occurs while checking the file status
+     */
+    private void createMissingDstDirsIfAbsent(String path) throws IOException {
+      rpcServer.overrideUser(UserGroupInformation.getLoginUser(), () -> {
+        MigrationPairList<RemoteLocation> missingPaths =
+            missingPathHandler.getMissingParentPaths(new Path(path));
+        if (!missingPaths.isEmpty()) {
+          missingPathHandler.copyMissingPathsFromSrc(missingPaths);
+        }
+        return null;
+      });
+    }
+
     /**
      * Get the missing parent directories for the given path.
      * @param path The path for which to get the missing parent directories.

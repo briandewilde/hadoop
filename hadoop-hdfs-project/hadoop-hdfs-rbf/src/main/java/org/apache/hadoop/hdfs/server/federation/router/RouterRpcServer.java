@@ -1634,6 +1634,32 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
   }
 
   /**
+   * Override the current user for the provided operation. Unlike
+   * setCurrentUser, this automatically resets the current user to the
+   * previous user once finished, but only if a previous user was set.
+   * @param ugi UserGroupInformation to set as the current user.
+   * @param operation Runnable operation to run as the overridden user.
+   * @return The result of the operation, can be null.
+   * @throws IOException If the operation fails with an IOException.
+   */
+  public <T> T overrideUser(UserGroupInformation ugi,
+      SupplierWithIOException<T> operation) throws IOException {
+    UserGroupInformation prevUgi = CUR_USER.get();
+    try {
+      CUR_USER.set(ugi);
+      return operation.get();
+    } finally {
+      // Reset to previous user
+      CUR_USER.set(prevUgi);
+    }
+  }
+
+  @FunctionalInterface
+  public interface SupplierWithIOException<T> {
+    T get() throws IOException;
+  }
+
+  /**
    * Merge the outputs from multiple namespaces.
    *
    * @param <T> The type of the objects to merge.
