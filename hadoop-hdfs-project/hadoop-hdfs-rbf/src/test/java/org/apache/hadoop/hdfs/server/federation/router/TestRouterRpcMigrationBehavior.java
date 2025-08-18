@@ -699,6 +699,49 @@ public class TestRouterRpcMigrationBehavior {
   }
 
   /**
+   * Test that migration metrics are propagated correctly to other routers.
+   * @throws IOException If an error occurs
+   */
+  @Test
+  public void testMigrationMetricsPropagate() throws IOException {
+    MetricsRegistry metricsRegistry =
+        resolver.getMigrationMetrics().getRegistry();
+
+    // Create a migrating mount table but do not update the mount table manager
+    Map<String, String> destMap = new HashMap<>();
+    destMap.put("ns0", sourcePath.toString());
+    destMap.put("ns1", sourcePath.toString());
+    MountTable entry = MountTable.newInstance(sourcePath.toString(), destMap);
+    entry.setMigratingMountPointInfo(
+        new MigratingMountPointInfo("ns0", "ns1"));
+    // Add the migrating mount table to the state store directly
+    routerContext.getRouter()
+        .getStateStore()
+        .getDriver()
+        .put(entry, true, true);
+
+    // Ensure the migration metrics are 0 even though state store is updated
+    {
+      MetricsRecordBuilder rb = getMetrics(MigrationMetrics.getName());
+      metricsRegistry.snapshot(rb, false);
+      assertGauge(
+          MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L,
+          rb);
+    }
+
+    // Reload the cache and ensure the migration metrics are updated
+    resolver.loadCache(true);
+    {
+      MetricsRecordBuilder rb = getMetrics(MigrationMetrics.getName());
+      metricsRegistry.snapshot(rb, false);
+      assertGauge(
+          MigrationMetrics.GaugeMetric.GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L,
+          rb);
+    }
+  }
+  
+
+  /**
    * Test that users with restricted permissions can still create and access
    * files, including creating missing directories
    * @throws Exception If an error occurs

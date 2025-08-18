@@ -100,7 +100,6 @@ public class TestMigratingMountTableResolver {
             "Test".getBytes()));
 
     setupMountTableEntry();
-    resolver.resetMigrationMetrics();
   }
 
   @After
@@ -109,6 +108,7 @@ public class TestMigratingMountTableResolver {
     // will share the same (invalid) RPC call id. To better simulate caching,
     // reset the context between tests.
     resolver.resetContext();
+    resolver.resetMigrationMetrics();
   }
 
   /**
@@ -160,9 +160,9 @@ public class TestMigratingMountTableResolver {
     MountTable entry = setupMountTableEntry("ns0", "ns1");
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MountTable migrationEntry =
-        resolver.reconcileEntryWithMigration(entry, null);
-    Assert.assertTrue(migrationEntry.getDestinations().stream()
+    resolver.reconcileEntryWithMigration(entry, null);
+    resolver.addEntry(entry);
+    Assert.assertTrue(entry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
@@ -174,9 +174,9 @@ public class TestMigratingMountTableResolver {
     MountTable entry = setupMountTableEntry();
     entry.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
-    MountTable migrationEntry =
-        resolver.reconcileEntryWithMigration(entry, null);
-    Assert.assertTrue(migrationEntry.getDestinations().stream()
+    resolver.reconcileEntryWithMigration(entry, null);
+    resolver.addEntry(entry);
+    Assert.assertTrue(entry.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
@@ -222,31 +222,33 @@ public class TestMigratingMountTableResolver {
 
   @Test
   public void testReconcileMigrationEntryForRollback() throws IOException {
-    MountTable entry1 = setupMountTableEntry("ns0");
+    MountTable entry1 =
+        MountTable.newInstance(path, ImmutableMap.of("ns0", path));
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     resolver.reconcileEntryWithMigration(entry1, null);
+    resolver.addEntry(entry1);
 
     // Assert metrics are updated for the migration
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
+    assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns1-ns0", 0L);
 
-    Map<String, String> destMap = new HashMap<>();
-    destMap.put("ns0", path);
-    destMap.put("ns1", path);
-    MountTable entry2 = MountTable.newInstance(path, destMap);
+    MountTable entry2 = MountTable.newInstance(path,
+        ImmutableMap.of("ns0", path, "ns1", path));
     entry2.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns1", "ns0"));
-    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
+    resolver.reconcileEntryWithMigration(entry2, entry1);
+    resolver.addEntry(entry2);
 
-    Assert.assertTrue(endEntry.getDestinations().stream()
+    Assert.assertTrue(entry2.getDestinations().stream()
         .map(RemoteLocation::getNameserviceId)
         .collect(Collectors.toSet()).containsAll(Arrays.asList("ns0", "ns1")));
-    Assert.assertNotNull(endEntry.getMigratingMountPointInfo());
+    Assert.assertNotNull(entry2.getMigratingMountPointInfo());
     Assert.assertEquals("ns0",
-        endEntry.getMigratingMountPointInfo().getDstNs());
+        entry2.getMigratingMountPointInfo().getDstNs());
     Assert.assertEquals("ns1",
-        endEntry.getMigratingMountPointInfo().getSrcNs());
+        entry2.getMigratingMountPointInfo().getSrcNs());
 
     // Assert metrics are updated for original and rollback migrations
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
@@ -293,24 +295,26 @@ public class TestMigratingMountTableResolver {
   @Test
   public void testReconcileMigrationEntryCompletesKeepingSrc()
       throws IOException {
-    MountTable entry1 = setupMountTableEntry("ns0");
+    MountTable entry1 =
+        MountTable.newInstance(path, ImmutableMap.of("ns0", path));
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     resolver.reconcileEntryWithMigration(entry1, null);
+    resolver.addEntry(entry1);
 
     // Assert metrics are set
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
 
-    Map<String, String> destMap = new HashMap<>();
-    destMap.put("ns0", path);
-    MountTable entry2 = MountTable.newInstance(path, destMap);
-    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
+    MountTable entry2 =
+        MountTable.newInstance(path, ImmutableMap.of("ns0", path));
+    resolver.reconcileEntryWithMigration(entry2, entry1);
+    resolver.addEntry(entry2);
 
-    Assert.assertNull(endEntry.getMigratingMountPointInfo());
-    Assert.assertEquals(1, endEntry.getDestinations().size());
+    Assert.assertNull(entry2.getMigratingMountPointInfo());
+    Assert.assertEquals(1, entry2.getDestinations().size());
     Assert.assertEquals("ns0",
-        endEntry.getDestinations().iterator().next().getNameserviceId());
+        entry2.getDestinations().iterator().next().getNameserviceId());
 
     // Assert metrics are reset
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
@@ -320,24 +324,25 @@ public class TestMigratingMountTableResolver {
   @Test
   public void testReconcileMigrationEntryCompletesKeepingDst()
       throws IOException {
-    MountTable entry1 = setupMountTableEntry("ns0");
+    MountTable entry1 =
+        MountTable.newInstance(path, ImmutableMap.of("ns0", path));
     entry1.setMigratingMountPointInfo(
         new MigratingMountPointInfo("ns0", "ns1"));
     resolver.reconcileEntryWithMigration(entry1, null);
+    resolver.addEntry(entry1);
 
     // Assert metrics are set
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 1L);
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS + ".ns0-ns1", 1L);
 
-    Map<String, String> destMap = new HashMap<>();
-    destMap.put("ns1", path);
-    MountTable entry2 = MountTable.newInstance(path, destMap);
-    MountTable endEntry = resolver.reconcileEntryWithMigration(entry2, entry1);
+    MountTable entry2 =
+        MountTable.newInstance(path, ImmutableMap.of("ns1", path));
+    resolver.addEntry(entry2);
 
-    Assert.assertNull(endEntry.getMigratingMountPointInfo());
-    Assert.assertEquals(1, endEntry.getDestinations().size());
+    Assert.assertNull(entry2.getMigratingMountPointInfo());
+    Assert.assertEquals(1, entry2.getDestinations().size());
     Assert.assertEquals("ns1",
-        endEntry.getDestinations().iterator().next().getNameserviceId());
+        entry2.getDestinations().iterator().next().getNameserviceId());
 
     // Assert metrics are reset
     assertConditionalGauge(GM_NUM_ACTIVE_MIGRATIONS.toString(), 0L);
@@ -1277,7 +1282,7 @@ public class TestMigratingMountTableResolver {
    * @param expected The expected value of the gauge
    */
   private void assertConditionalGauge(String name, long expected) {
-    assertEquals(getLongMetric(name, MetricsAsserts::getLongGauge), expected);
+    assertEquals(expected, getLongMetric(name, MetricsAsserts::getLongGauge));
   }
 
   /**
@@ -1287,7 +1292,7 @@ public class TestMigratingMountTableResolver {
    * @param expected The expected value of the counter                                                     
    */
   private void assertConditionalCounter(String name, long expected) {
-    assertEquals(getLongMetric(name, MetricsAsserts::getLongCounter), expected);
+    assertEquals(expected, getLongMetric(name, MetricsAsserts::getLongCounter));
   }
 
   /**

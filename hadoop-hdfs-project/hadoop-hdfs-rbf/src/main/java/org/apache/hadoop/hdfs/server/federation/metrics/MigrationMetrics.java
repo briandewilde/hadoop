@@ -3,10 +3,9 @@ package org.apache.hadoop.hdfs.server.federation.metrics;
 import java.io.IOException;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Consumer;
-import javax.annotation.Nullable;
 import org.apache.hadoop.classification.VisibleForTesting;
 import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver.MigrationPair;
 import org.apache.hadoop.hdfs.server.federation.router.RBFConfigKeys;
 import org.apache.hadoop.metrics2.MetricsCollector;
 import org.apache.hadoop.metrics2.MetricsSource;
@@ -75,7 +74,10 @@ public class MigrationMetrics implements MetricsSource {
 
   @Override
   public void getMetrics(MetricsCollector collector, boolean all) {
-    registry.snapshot(collector.addRecord(registry.info()), all);
+    // Synchronized block allows multiple specific metrics to be set atomically
+    synchronized (this) {
+      registry.snapshot(collector.addRecord(registry.info()), all);
+    }
   }
 
   @VisibleForTesting
@@ -108,43 +110,62 @@ public class MigrationMetrics implements MetricsSource {
       new ConcurrentHashMap<>();
 
   /**
-   * Increment a gauge metric by 1.
-   * @param metric the gauge metric to update
-   * @param srcNs the source namespace, can be null
-   * @param dstNs the destination namespace, can be null
+   * Set a generic gauge metric to the provided value.
+   * @param metric the gauge metric to set
+   * @param val the value to set the gauge metric to
    */
-  public void incrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
-    updateGaugeMetric(metric, MutableGaugeLong::incr, srcNs, dstNs);
+  public void setGenericGaugeMetric(GaugeMetric metric, long value) {
+    gaugeMetricsMap.computeIfAbsent(metric.metricName,
+        k -> registry.newGauge(metric.metricName, metric.metricDesc, value))
+        .set(value);
   }
 
   /**
-   * Decrement a gauge metric by 1.
-   * @param metric the gauge metric to update
-   * @param srcNs the source namespace, can be null
-   * @param dstNs the destination namespace, can be null
+   * Set a specific gauge metric for a given source and destination to the
+   * provided value. This does not update the generic metric.
+   * @param metric the gauge metric to set
+   * @param srcNs the source namespace
+   * @param dstNs the destination namespace
+   * @param val the value to set the specific gauge metric to
    */
-  public void decrGaugeMetric(GaugeMetric metric, String srcNs, String dstNs) {
-    updateGaugeMetric(metric, MutableGaugeLong::decr, srcNs, dstNs);
+  public void setSpecificGaugeMetric(GaugeMetric metric, String srcNs,
+      String dstNs, long value) {
+    String specificName =
+        buildSpecificMetricName(metric.metricName, srcNs, dstNs);
+    gaugeMetricsMap.computeIfAbsent(specificName,
+        k -> registry.newGauge(specificName,
+            buildSpecificMetricDesc(metric.metricName, srcNs, dstNs), value))
+        .set(value);
   }
 
   /**
-   * Update a gauge metric using the provided consumer function.
-   * @param metric the gauge metric to update
-   * @param consumer the consumer function to apply to the gauge
-   * @param srcNs the source namespace, can be null
-   * @param dstNs the destination namespace, can be null
+   * Set gauge metrics for the generic and all specific metrics provided
+   * by the metricsMap atomically.
+   * @param metric the gauge metric to set
+   * @param metricsMap a map of migration src-dst pairs to their values
    */
-  private void updateGaugeMetric(GaugeMetric metric,
-      Consumer<MutableGaugeLong> consumer, @Nullable String srcNs,
-      @Nullable String dstNs) {
-    consumer.accept(gaugeMetricsMap.computeIfAbsent(metric.metricName,
-        k -> registry.newGauge(metric.metricName, metric.metricDesc, 0L)));
-    if (srcNs != null && dstNs != null) {
-      String specificName =
-          buildSpecificMetricName(metric.metricName, srcNs, dstNs);
-      consumer.accept(gaugeMetricsMap.computeIfAbsent(specificName,
-          k -> registry.newGauge(specificName,
-              buildSpecificMetricDesc(metric.metricName, srcNs, dstNs), 0L)));
+  public void setGaugeMetricsMap(GaugeMetric metric,
+      Map<MigrationPair<String>, Long> metricsMap) {
+    // Synchronized block ensures all specific gauge metrics are set atomically
+    synchronized (this) {
+      // Reset all gauge metrics before setting new values
+      for (MutableGaugeLong gauge : gaugeMetricsMap.values()) {
+        gauge.set(0L);
+      }
+
+      // Set new specific metrics and calculate total value
+      long totalValue = 0;
+      for (Map.Entry<MigrationPair<String>, Long> entry :
+          metricsMap.entrySet()) {
+        // Set the specific metric
+        setSpecificGaugeMetric(metric, entry.getKey().getSrc(),
+            entry.getKey().getDst(), entry.getValue());
+
+        totalValue += entry.getValue();
+      }
+
+      // Set total value for generic metric
+      setGenericGaugeMetric(metric, totalValue);
     }
   }
 

@@ -365,8 +365,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
         }
         LOG.info("Adding migration info ({} => {}->{}) for {}",
             srcNsId, srcNsId, dstNsId, sourcePath);
-        migrationMetrics.incrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS, srcNsId,
-            dstNsId);
       } else if (newMigrationInfo == null) {
         // Removing migration info, since the new mount point is not migrating
         if (newNsIds.size() > 1) {
@@ -376,8 +374,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
         String newNsId = newNsIds.isEmpty() ? null : newNsIds.iterator().next();
         LOG.info("Removing migration info ({}->{} => {}) for {}",
             srcNsId, dstNsId, newNsId, sourcePath);
-        migrationMetrics.decrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS, srcNsId,
-            dstNsId);
       } else {
         // Updating migration info, since the new mount point is migrating and
         // the old mount point was already migrating
@@ -392,14 +388,6 @@ public class MigratingMountTableResolver extends MountTableResolver {
         }
         // Ensure that any changes to the migration info are valid
         verifyMigrationUpdate(newMigrationInfo, oldMigrationInfo, sourcePath);
-
-        // If there are changes to the migration info, update metrics
-        if (!newMigrationInfo.equals(oldMigrationInfo)) {
-          migrationMetrics.incrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS,
-              newMigrationInfo.getSrcNs(), newMigrationInfo.getDstNs());
-          migrationMetrics.decrGaugeMetric(GM_NUM_ACTIVE_MIGRATIONS,
-              oldMigrationInfo.getSrcNs(), oldMigrationInfo.getDstNs());
-        }
       }
       
       // Reconcile the entry locations to match the migration only if the mount
@@ -1124,6 +1112,85 @@ public class MigratingMountTableResolver extends MountTableResolver {
     return migrationMetrics;
   }
 
+  /**
+   * Load the cache using the super method and update the migration metrics
+   * based on all active migrations in the mount table.
+   * @param force If we force the load.
+   * @return True if the cache was loaded, false otherwise.
+   */
+  @Override
+  public boolean loadCache(boolean force) {
+    boolean result = super.loadCache(force);
+    try {
+      updateActiveMigrationMetrics();
+    } catch (IOException e) {
+      LOG.error("Unable to update num active migration metrics from cache", e);
+    }
+    return result;
+  }
+
+  /**
+   * Add a mount table entry using the super method and update the migration
+   * metrics
+   * @param entry The mount table record to add from the state store.
+   */
+  @Override
+  public void addEntry(MountTable entry) {
+    super.addEntry(entry);
+    try {
+      updateActiveMigrationMetrics();
+    } catch (IOException e) {
+      LOG.error("Unable to update num active migration metrics after adding"
+          + " entry for " + entry.getSourcePath(), e);
+    }
+  }
+
+  /**
+   * Remove a mount table entry using the super method and update the migration
+   * metrics
+   * @param srcPath Source path for the entry to remove.
+   */
+  @Override
+  public void removeEntry(String srcPath) {
+    super.removeEntry(srcPath);
+    try {
+      updateActiveMigrationMetrics();
+    } catch (IOException e) {
+      LOG.error("Unable to update num active migration metrics after removing"
+          + " entry for " + srcPath, e);
+    }
+  }
+
+  /**
+   * Update the active migration metrics based on the current mount table.
+   * @throws IOException If an error occurs while retrieving mount tables
+   */
+  private void updateActiveMigrationMetrics() throws IOException {
+    // Since this is only used for metrics, a read lock is not needed.
+    // Num active migration metrics will reflect a point in time snapshot.
+
+    // Build a map of active migration counts per nameservice pair; this will
+    // be used to set each migration metric entry atomically, to avoid the
+    // potential of metrics being emitted with inconsistent values
+    Map<MigrationPair<String>, Long> numActiveMigrations = new HashMap<>();
+    List<MountTable> mountTables = getMounts("/");
+    for (MountTable mountTable : mountTables) {
+      MigratingMountPointInfo migratingMountPointInfo =
+          mountTable.getMigratingMountPointInfo();
+      if (migratingMountPointInfo != null) {
+        // Increment (or initialize to 1) the count for the nameservice pair
+        numActiveMigrations.merge(MigrationPair.of(migratingMountPointInfo.getSrcNs(),
+            migratingMountPointInfo.getDstNs()), 1L, Long::sum);
+      }
+    }
+    migrationMetrics.setGaugeMetricsMap(GM_NUM_ACTIVE_MIGRATIONS,
+        numActiveMigrations);
+  }
+
+  /**
+   * A list of migration pairs
+   * @param <T> The type of the migration pair, typically RemoteLocation
+   */
   private static class MigrationPairList<T>
       extends LinkedList<MigrationPair<T>> {
     private static final MigrationPairList<?> EMPTY_LIST =
@@ -1161,7 +1228,7 @@ public class MigratingMountTableResolver extends MountTableResolver {
    * A migration pair defines a source and destination of the same type,
    * typically RemoteLocation.
    */
-  private static class MigrationPair<T> {
+  public static class MigrationPair<T> {
     private final T src;
     private final T dst;
 
