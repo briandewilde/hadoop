@@ -25,6 +25,7 @@ import static org.apache.hadoop.hdfs.server.federation.store.FederationStateStor
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.IOException;
@@ -33,6 +34,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.AddMountTableEntryRequest;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.AddMountTableEntryResponse;
 import org.apache.hadoop.hdfs.server.federation.store.protocol.GetMountTableEntriesRequest;
@@ -202,6 +204,40 @@ public class TestStateStoreMountTable extends TestStateStoreBase {
     assertNotNull(matchingEntry1);
     assertEquals("testnameservice",
         matchingEntry1.getDefaultLocation().getNameserviceId());
+  }
+  
+  @Test
+  public void testMigratingMountPointInfo() throws IOException {
+    // Add 1
+    List<MountTable> entries = createMockMountTable(nameservices);
+    MountTable entry0 = entries.get(0);
+    String srcPath = entry0.getSourcePath();
+    AddMountTableEntryRequest request =
+        AddMountTableEntryRequest.newInstance(entry0);
+    AddMountTableEntryResponse response =
+        mountStore.addMountTableEntry(request);
+    assertTrue(response.getStatus());
+
+    // Verify
+    mountStore.loadCache(true);
+    MountTable matchingEntry0 = getMountTableEntry(srcPath);
+    assertNotNull(matchingEntry0);
+    assertNull(matchingEntry0.getMigratingMountPointInfo());
+
+    // Edit destination nameservice for source path
+    matchingEntry0.setMigratingMountPointInfo(
+            new MigratingMountPointInfo("srcNs", "dstNs"));
+    UpdateMountTableEntryRequest updateRequest =
+        UpdateMountTableEntryRequest.newInstance(matchingEntry0);
+    UpdateMountTableEntryResponse updateResponse =
+        mountStore.updateMountTableEntry(updateRequest);
+    assertTrue(updateResponse.getStatus());
+
+    // Verify
+    mountStore.loadCache(true);
+    MountTable matchingEntry1 = getMountTableEntry(srcPath);
+    assertNotNull(matchingEntry1);
+    assertNotNull(matchingEntry0.getMigratingMountPointInfo());
   }
 
   /**

@@ -80,6 +80,7 @@ import org.apache.hadoop.hdfs.security.token.delegation.DelegationTokenIdentifie
 import org.apache.hadoop.hdfs.server.federation.resolver.ActiveNamenodeResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.FederationNamespaceInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.FileSubclusterResolver;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver.MigrationBehavior;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RouterResolveException;
@@ -237,6 +238,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public LocatedBlocks getBlockLocations(String src, final long offset,
       final long length) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LATEST, src);
 
     List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
@@ -269,6 +271,7 @@ public class RouterClientProtocol implements ClientProtocol {
       String storagePolicy)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     if (createParent && rpcServer.isPathAll(src)) {
       int index = src.lastIndexOf(Path.SEPARATOR);
@@ -472,6 +475,7 @@ public class RouterClientProtocol implements ClientProtocol {
       String[] favoredNodes, EnumSet<AddBlockFlag> addBlockFlags)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("addBlock",
         new Class<?>[] {String.class, String.class, ExtendedBlock.class,
@@ -502,6 +506,7 @@ public class RouterClientProtocol implements ClientProtocol {
       final int numAdditionalNodes, final String clientName)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("getAdditionalDatanode",
         new Class<?>[] {String.class, long.class, ExtendedBlock.class,
@@ -536,6 +541,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public boolean complete(String src, String clientName, ExtendedBlock last,
       long fileId) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     RemoteMethod method = new RemoteMethod("complete",
         new Class<?>[] {String.class, String.class, ExtendedBlock.class,
@@ -723,6 +729,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public boolean mkdirs(String src, FsPermission masked, boolean createParent)
       throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.DST_ONLY, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false);
@@ -775,6 +782,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public DirectoryListing getListing(String src, byte[] startAfter,
       boolean needLocation) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.UNION, src);
 
     List<RemoteResult<RemoteLocation, DirectoryListing>> listings =
         getListingInt(src, startAfter, needLocation);
@@ -896,6 +904,7 @@ public class RouterClientProtocol implements ClientProtocol {
   @Override
   public HdfsFileStatus getFileInfo(String src) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.READ);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LATEST, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, false, false);
@@ -1247,6 +1256,7 @@ public class RouterClientProtocol implements ClientProtocol {
   public void fsync(String src, long fileId, String clientName,
       long lastBlockLength) throws IOException {
     rpcServer.checkOperation(NameNode.OperationCategory.WRITE);
+    rpcServer.setMigrationBehavior(MigrationBehavior.LEASED, src);
 
     final List<RemoteLocation> locations =
         rpcServer.getLocationsForPath(src, true, false);

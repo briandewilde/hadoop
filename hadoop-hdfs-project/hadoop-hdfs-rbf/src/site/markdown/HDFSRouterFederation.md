@@ -299,6 +299,65 @@ Note that this can lead to a file to be written in multiple subclusters or a fol
 One needs to be aware of the possibility of these inconsistencies and target this `faulttolerant` approach to resilient paths.
 An example for this is the `/app-logs` folder which will mostly write once into a subfolder.
 
+#### Mount table migration
+The Router can migrate mount points from one subcluster to another, as long as both subclusters map to known nameservices.
+
+During the migration, the Router will forward operations sent to the source subcluster to the source and/or destination subclusters based on the migration behavior specified for each operation. As a result, neither the source nor destination subcluster serves as the source of truth during the migration; the source of truth can only be read from the Router.
+
+A mount point can only migrate to another nameservice, meaning the source nameservice must already be assigned to the mount point. When the mount point enters migration, the destination nameservice will also be added to the mount point, and a corresponding `RemoteLocation` object will be created on the destination nameservice for each existing `RemoteLocation` object on the source nameservice. The destination nameservice does not need to exist as a mount point. Nested mount points are currently not supported.
+
+Migration only affects the Router's handling of operations, but does not drive the data movement; for that, one should use a tool like `distcp` to copy the data from the source subcluster to the destination subcluster. `distcp` should be started after the migration is started, and should be stopped before the migration is ended.
+
+##### Migration behaviors
+
+The migration behavior should be set for each operation which supports migration in RouterClientProtocol as such:
+```java
+setMigrationBehavior(MigrationBehavior.LATEST, path);
+```
+
+No other logic is needed in the operation path; it is called automatically through the `MigratingMountTableResolver#getDestinationForPath` method.
+
+If there is no migration, this is effectively a no-op. (The call will save that no migration is in progress, so that the behavior is consistent if a migration starts between the call to `setBehavior` and `getDestinationForPath`.)
+
+If there is a migration, the behavior will be set to the specified value. The call to `getDestinationForPath` will implement all of the migration logic and adjust the returned `PathLocation` object to ensure the operation is directed to the correct namenode(s).
+
+If the operation does not call `getDestinationForPath`, the migration behavior is ignored.
+
+If the migration behavior is not specified, it defaults to `MigrationBehavior.UNDEFINED` which causes an exception to be thrown and the operation to fail.
+
+The following migration behaviors are supported:
+* LATEST: The Router will issue the op to whichever subcluster has the latest version of the data, or the destination if both are up to date. Intended for read operations.
+  * The modtime is used to determine the latest. Since directories do not have accurate modtimes, the destination is always preferred.
+  * If a subcluster does not have the file, the other is preferred.
+* UNION: The Router will issue the op to both subclusters. Intended for listing operations.
+* UNDEFINED: The Router will throw an exception and cause the operation to fail.
+
+Note: Migration behaviors such as LATEST will result in multiple calls to the namenodes; e.g. first to determine the latest file, and then to get the file. As a result, the operation may be slower than a normal operation and the operation is no longer atomic. To ensures consistency, the migration context cache saves the migration behavior and references to respective objects (such as `MigratingMountPointInfo`) when the migration behavior is set or the context is first retrieved. This context is recycled for each new operation.
+
+##### Controlling a migration
+
+To start a migration for `/path` from `ns1` to `ns2`, one can use the following command to update the source mount point (`ns1` mounted as `/path`) to migrate to the destination nameservice (`ns2`):
+
+    [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path -setMigration ns1 ns2
+
+To end the migration, one must specify the nameservice to keep as demonstrated in the following scenarios:
+
+If the migration completes successfully, the destination subcluster should be kept, replacing the source subcluster:
+
+    [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path ns2 -clrMigration
+
+If the migration did not complete successfully, it can be rolled back during which data that was written to the destination subcluster should be copied to the source subcluster:
+
+    [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path -setMigration ns2 ns1
+
+To end the migration by keeping only the source subcluster, either having completed a rollback or else losing all data written to the destination subcluster:
+
+    [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path ns1 -clrMigration
+
+To end the migration by keeping only the destination cluster, either having completed the data copy or else losing all data not copied to the destination subcluster:
+
+    [hdfs]$ $HADOOP_HOME/bin/hdfs dfsrouteradmin -update /path ns2 -clrMigration
+
 ### Disabling nameservices
 
 To prevent accessing a nameservice (sublcuster), it can be disabled from the federation.
@@ -463,10 +522,10 @@ The connection to the State Store and the internal caching at the Router.
 
 Forwarding client requests to the right subcluster.
 
-| Property | Default | Description|
-|:---- |:---- |:---- |
-| dfs.federation.router.file.resolver.client.class | `org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver` | Class to resolve files to subclusters. To enable multiple subclusters for a mount point, set to org.apache.hadoop.hdfs.server.federation.resolver.MultipleDestinationMountTableResolver. |
-| dfs.federation.router.namenode.resolver.client.class | `org.apache.hadoop.hdfs.server.federation.resolver.MembershipNamenodeResolver` | Class to resolve the namenode for a subcluster. |
+| Property | Default | Description                                                                                                                                                                                                                                                                                                    |
+|:---- |:---- |:---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| dfs.federation.router.file.resolver.client.class | `org.apache.hadoop.hdfs.server.federation.resolver.MountTableResolver` | Class to resolve files to subclusters. To enable multiple subclusters for a mount point, set to org.apache.hadoop.hdfs.server.federation.resolver.MultipleDestinationMountTableResolver. To enable subcluster migration, set to org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver. |
+| dfs.federation.router.namenode.resolver.client.class | `org.apache.hadoop.hdfs.server.federation.resolver.MembershipNamenodeResolver` | Class to resolve the namenode for a subcluster.                                                                                                                                                                                                                                                                |
 
 ### Namenode monitoring
 

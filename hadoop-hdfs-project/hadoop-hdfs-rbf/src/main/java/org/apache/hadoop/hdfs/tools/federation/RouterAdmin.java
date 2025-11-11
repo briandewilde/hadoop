@@ -39,6 +39,7 @@ import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.DFSConfigKeys;
 import org.apache.hadoop.hdfs.HdfsConfiguration;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.MountTableManager;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.RouterGenericManager;
@@ -159,13 +160,16 @@ public class RouterAdmin extends Configured implements Tool {
       return "\t[-add <source> <nameservice1, nameservice2, ...> <destination> "
           + "[-readonly] [-faulttolerant] "
           + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-          + "-owner <owner> -group <group> -mode <mode>]";
+          + "-owner <owner> -group <group> -mode <mode> "
+          + "[-setMigration <sourceNamespace> <destinationNamespace>]]";
     } else if (cmd.equals("-update")) {
       return "\t[-update <source>"
           + " [<nameservice1, nameservice2, ...> <destination>] "
           + "[-readonly true|false] [-faulttolerant true|false] "
           + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-          + "-owner <owner> -group <group> -mode <mode>]";
+          + "-owner <owner> -group <group> -mode <mode> "
+          + "[-setMigration <sourceNamespace> <destinationNamespace>] "
+          + "[-clrMigration]]";
     } else if (cmd.equals("-rm")) {
       return "\t[-rm <source>]";
     } else if (cmd.equals("-ls")) {
@@ -255,7 +259,7 @@ public class RouterAdmin extends Configured implements Tool {
         return false;
       }
     } else if ("-update".equals(cmd)) {
-      if (argv.length < 4) {
+      if (argv.length < 2) {
         return false;
       }
     } else if ("-rm".equals(cmd)) {
@@ -523,6 +527,8 @@ public class RouterAdmin extends Configured implements Tool {
     String group = null;
     FsPermission mode = null;
     DestinationOrder order = DestinationOrder.HASH;
+    String srcNs = null;
+    String dstNs = null;
     while (i < parameters.length) {
       if (parameters[i].equals("-readonly")) {
         readOnly = true;
@@ -545,6 +551,10 @@ public class RouterAdmin extends Configured implements Tool {
         i++;
         short modeValue = Short.parseShort(parameters[i], 8);
         mode = new FsPermission(modeValue);
+      } else if (parameters[i].equals("-setMigration")) {
+        i++;
+        srcNs = parameters[i++];
+        dstNs = parameters[i];
       } else {
         printUsage("-add");
         return false;
@@ -554,7 +564,7 @@ public class RouterAdmin extends Configured implements Tool {
     }
 
     return addMount(mount, nss, dest, readOnly, faultTolerant, order,
-        new ACLEntity(owner, group, mode));
+        new ACLEntity(owner, group, mode), new MigratingMountPointInfo(srcNs, dstNs));
   }
 
   /**
@@ -566,12 +576,13 @@ public class RouterAdmin extends Configured implements Tool {
    * @param readonly If the mount point is read only.
    * @param order Order of the destination locations.
    * @param aclInfo the ACL info for mount point.
+   * @param migratingMountPointInfo containing source and destination of the migration
    * @return If the mount point was added.
    * @throws IOException Error adding the mount point.
    */
   public boolean addMount(String mount, String[] nss, String dest,
       boolean readonly, boolean faultTolerant, DestinationOrder order,
-      ACLEntity aclInfo)
+      ACLEntity aclInfo, MigratingMountPointInfo migratingMountPointInfo)
       throws IOException {
     mount = normalizeFileSystemPath(mount);
     // Get the existing entry
@@ -608,6 +619,9 @@ public class RouterAdmin extends Configured implements Tool {
         newEntry.setMode(aclInfo.getMode());
       }
 
+      if (migratingMountPointInfo.getSrcNs() != null && migratingMountPointInfo.getDstNs() != null) {
+        newEntry.setMigratingMountPointInfo(migratingMountPointInfo);
+      }
       newEntry.validate();
 
       AddMountTableEntryRequest request =
@@ -650,6 +664,9 @@ public class RouterAdmin extends Configured implements Tool {
         existingEntry.setMode(aclInfo.getMode());
       }
 
+      if (migratingMountPointInfo.getSrcNs() != null && migratingMountPointInfo.getDstNs() != null) {
+        existingEntry.setMigratingMountPointInfo(migratingMountPointInfo);
+      }
       existingEntry.validate();
 
       UpdateMountTableEntryRequest updateRequest =
@@ -730,6 +747,19 @@ public class RouterAdmin extends Configured implements Tool {
           short modeValue = Short.parseShort(parameters[i], 8);
           existingEntry.setMode(new FsPermission(modeValue));
           break;
+        case "-setMigration":
+          i++;
+          try {
+            String srcNs = parameters[i++];
+            String dstNs = parameters[i];
+            existingEntry.setMigratingMountPointInfo(new MigratingMountPointInfo(srcNs, dstNs));
+            break;
+          } catch (Exception e) {
+            throw new Exception("Cannot parse migration: ");
+          }
+          case "-clrMigration":
+            existingEntry.setMigratingMountPointInfo(null);
+            break;
         default:
           printUsage("-update");
           return false;
@@ -853,10 +883,10 @@ public class RouterAdmin extends Configured implements Tool {
   private static void printMounts(List<MountTable> entries, boolean detail) {
     System.out.println("Mount Table Entries:");
     if (detail) {
-      System.out.println(
-          String.format("%-25s %-25s %-25s %-25s %-10s %-30s %-10s %-10s %-15s",
-              "Source", "Destinations", "Owner", "Group", "Mode", "Quota/Usage",
-              "Order", "ReadOnly", "FaultTolerant"));
+      System.out.println(String.format(
+          "%-25s %-25s %-25s %-25s %-10s %-30s %-10s %-10s %-15s %-25s",
+          "Source", "Destinations", "Owner", "Group", "Mode", "Quota/Usage",
+          "Order", "ReadOnly", "FaultTolerant", "Migrating"));
     } else {
       System.out.println(String.format("%-25s %-25s %-25s %-25s %-10s %-30s",
           "Source", "Destinations", "Owner", "Group", "Mode", "Quota/Usage"));
@@ -886,6 +916,11 @@ public class RouterAdmin extends Configured implements Tool {
 
         System.out.print(String.format(" %-15s",
             entry.isFaultTolerant() ? "Fault-Tolerant" : ""));
+
+        System.out.print(entry.getMigratingMountPointInfo() == null ? ""
+            : String.format(" %-25s", String.join("->",
+                entry.getMigratingMountPointInfo().getSrcNs(),
+                entry.getMigratingMountPointInfo().getDstNs())));
       }
       System.out.println();
     }

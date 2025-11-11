@@ -17,9 +17,12 @@
  */
 package org.apache.hadoop.hdfs.server.federation.router;
 
+import static org.apache.hadoop.hdfs.DFSConfigKeys.*;
 import static org.apache.hadoop.hdfs.server.federation.FederationTestUtils.createNamenodeReport;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayOutputStream;
@@ -102,6 +105,7 @@ public class TestRouterAdminCLI {
         .quota()
         .safemode()
         .build();
+    conf.set(DFS_NAMESERVICES, "ns0,ns1");
     cluster.addRouterOverrides(conf);
 
     // Start routers
@@ -189,7 +193,7 @@ public class TestRouterAdminCLI {
     // test mount table update behavior
     dest = dest + "-new";
     argv = new String[] {"-add", src, nsId, dest, "-readonly",
-        "-faulttolerant", "-order", "HASH_ALL"};
+        "-faulttolerant", "-order", "HASH_ALL", "-setMigration", "ns0", "ns1"};
     assertEquals(0, ToolRunner.run(admin, argv));
     stateStore.loadCache(MountTableStoreImpl.class, true);
 
@@ -205,6 +209,8 @@ public class TestRouterAdminCLI {
     assertEquals(dest, loc3.getDest());
     assertTrue(mountTable.isReadOnly());
     assertTrue(mountTable.isFaultTolerant());
+    assertEquals("ns0", mountTable.getMigratingMountPointInfo().getSrcNs());
+    assertEquals("ns1", mountTable.getMigratingMountPointInfo().getDstNs());
   }
 
   @Test
@@ -350,7 +356,8 @@ public class TestRouterAdminCLI {
   public void testListWithDetails() throws Exception {
     // Create mount entry.
     String[] argv = new String[] {"-add", "/testLsWithDetails", "ns0,ns1",
-        "/dest", "-order", "HASH_ALL", "-readonly", "-faulttolerant"};
+        "/dest", "-order", "HASH_ALL", "-readonly", "-faulttolerant",
+        "-setMigration", "ns0", "ns1"};
     assertEquals(0, ToolRunner.run(admin, argv));
     System.setOut(new PrintStream(out));
     stateStore.loadCache(MountTableStoreImpl.class, true);
@@ -361,6 +368,7 @@ public class TestRouterAdminCLI {
     String response =  out.toString();
     assertTrue(response.contains("Read-Only"));
     assertTrue(response.contains("Fault-Tolerant"));
+    assertTrue(response.contains("Migrating"));
     out.reset();
 
     // Test list with detail without path.
@@ -403,6 +411,63 @@ public class TestRouterAdminCLI {
     assertEquals(0, ToolRunner.run(admin, argv));
     assertTrue(out.toString().contains(dir2 + "/subdir1"));
     assertTrue(out.toString().contains(dir2 + "/subdir2"));
+  }
+  
+  @Test
+  public void testAddUpdateAndClearMigration() throws Exception {
+    String nsId = "ns0,ns1";
+    String src = "/test-set-clear-migration";
+    String dest = "/set-clear-migration";
+    // Add mount table entry to set migration
+    String[] argv = new String[] {"-add", src, nsId, dest, "-setMigration",
+        "ns0", "ns1"};
+    assertEquals(0, ToolRunner.run(admin, argv));
+    assertEquals(-1, ToolRunner.run(admin, argv));
+
+    stateStore.loadCache(MountTableStoreImpl.class, true);
+    GetMountTableEntriesRequest getRequest = GetMountTableEntriesRequest
+        .newInstance(src);
+    GetMountTableEntriesResponse getResponse = client.getMountTableManager()
+        .getMountTableEntries(getRequest);
+    MountTable mountTable = getResponse.getEntries().get(0);
+    assertNotNull(mountTable.getMigratingMountPointInfo());
+    assertEquals("ns0", mountTable.getMigratingMountPointInfo().getSrcNs());
+    assertEquals("ns1", mountTable.getMigratingMountPointInfo().getDstNs());
+    
+    // Update mount table migration to ensure migration is not cleared
+    argv = new String[] {"-update", src, nsId, dest, "-readonly", "false"};
+    assertEquals(0, ToolRunner.run(admin, argv));
+    stateStore.loadCache(MountTableStoreImpl.class, true);
+    getRequest = GetMountTableEntriesRequest.newInstance(src);
+    getResponse =
+        client.getMountTableManager().getMountTableEntries(getRequest);
+    mountTable = getResponse.getEntries().get(0);
+    assertNotNull(mountTable.getMigratingMountPointInfo());
+    assertEquals("ns0", mountTable.getMigratingMountPointInfo().getSrcNs());
+    assertEquals("ns1", mountTable.getMigratingMountPointInfo().getDstNs());
+
+    // Update mount table migration to simulate a rollback
+    argv = new String[] {"-update", src, nsId, dest, "-setMigration",
+        "ns1", "ns0"};
+    assertEquals(0, ToolRunner.run(admin, argv));
+    stateStore.loadCache(MountTableStoreImpl.class, true);
+    getRequest = GetMountTableEntriesRequest.newInstance(src);
+    getResponse =
+        client.getMountTableManager().getMountTableEntries(getRequest);
+    mountTable = getResponse.getEntries().get(0);
+    assertNotNull(mountTable.getMigratingMountPointInfo());
+    assertEquals("ns1", mountTable.getMigratingMountPointInfo().getSrcNs());
+    assertEquals("ns0", mountTable.getMigratingMountPointInfo().getDstNs());
+    
+    // Update mount table entry to clear migration
+    argv = new String[] {"-update", src, nsId, dest, "-clrMigration"};
+    assertEquals(0, ToolRunner.run(admin, argv));
+    stateStore.loadCache(MountTableStoreImpl.class, true);
+    getRequest = GetMountTableEntriesRequest.newInstance(src);
+    getResponse =
+        client.getMountTableManager().getMountTableEntries(getRequest);
+    mountTable = getResponse.getEntries().get(0);
+    assertNull(mountTable.getMigratingMountPointInfo());
   }
 
   @Test
@@ -604,16 +669,20 @@ public class TestRouterAdminCLI {
         "\t[-add <source> <nameservice1, nameservice2, ...> <destination> "
             + "[-readonly] [-faulttolerant] "
             + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-            + "-owner <owner> -group <group> -mode <mode>]"));
+            + "-owner <owner> -group <group> -mode <mode> "
+            + "[-setMigration <sourceNamespace> <destinationNamespace>]]"));
     out.reset();
 
     argv = new String[] {"-update", src, nsId};
     assertEquals(-1, ToolRunner.run(admin, argv));
-    assertTrue("Wrong message: " + out, out.toString().contains(
+    String outstring1 = out.toString();
+    assertTrue("Wrong message: " + out, outstring1.contains(
         "\t[-update <source> [<nameservice1, nameservice2, ...> <destination>] "
             + "[-readonly true|false] [-faulttolerant true|false] "
             + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-            + "-owner <owner> -group <group> -mode <mode>]"));
+            + "-owner <owner> -group <group> -mode <mode> " 
+            + "[-setMigration <sourceNamespace> <destinationNamespace>] "
+            + "[-clrMigration]]"));
     out.reset();
 
     argv = new String[] {"-rm"};
@@ -661,12 +730,16 @@ public class TestRouterAdminCLI {
         + "\t[-add <source> <nameservice1, nameservice2, ...> <destination> "
         + "[-readonly] [-faulttolerant] "
         + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-        + "-owner <owner> -group <group> -mode <mode>]\n"
+        + "-owner <owner> -group <group> -mode <mode> " 
+        + "[-setMigration <sourceNamespace> <destinationNamespace>]]\n"
         + "\t[-update <source> [<nameservice1, nameservice2, ...> "
         + "<destination>] [-readonly true|false]"
         + " [-faulttolerant true|false] "
         + "[-order HASH|LOCAL|RANDOM|HASH_ALL|SPACE] "
-        + "-owner <owner> -group <group> -mode <mode>]\n" + "\t[-rm <source>]\n"
+        + "-owner <owner> -group <group> -mode <mode> "
+        + "[-setMigration <sourceNamespace> <destinationNamespace>] "
+        + "[-clrMigration]]\n"
+        + "\t[-rm <source>]\n"
         + "\t[-ls [-d] <path>]\n"
         + "\t[-getDestination <path>]\n"
         + "\t[-setQuota <path> -nsQuota <nsQuota> -ssQuota"
@@ -1232,6 +1305,7 @@ public class TestRouterAdminCLI {
     // Ensure mount table added successfully
     MountTable mountTable = getResponse.getEntries().get(0);
     assertEquals(src, mountTable.getSourcePath());
+    assertNull(mountTable.getMigratingMountPointInfo());
 
     // Update the destination
     String newNsId = "ns0";
@@ -1253,7 +1327,8 @@ public class TestRouterAdminCLI {
     assertEquals("HASH_ALL", mountTable.getDestOrder().toString());
 
     // Update the attribute.
-    argv = new String[] {"-update", src, "-readonly", "false"};
+    argv = new String[] {"-update", src, "-readonly", "false",
+        "-setMigration", "ns0", "ns1"};
     assertEquals(0, ToolRunner.run(admin, argv));
 
     stateStore.loadCache(MountTableStoreImpl.class, true);
@@ -1269,7 +1344,9 @@ public class TestRouterAdminCLI {
     assertEquals(newDest, mountTable.getDestinations().get(0).getDest());
     assertFalse(mountTable.isReadOnly());
     assertEquals("HASH_ALL", mountTable.getDestOrder().toString());
-
+    assertNotNull(mountTable.getMigratingMountPointInfo());
+    assertEquals("ns0", mountTable.getMigratingMountPointInfo().getSrcNs());
+    assertEquals("ns1", mountTable.getMigratingMountPointInfo().getDstNs());
   }
 
   @Test
@@ -1311,6 +1388,27 @@ public class TestRouterAdminCLI {
     assertEquals(-1, ToolRunner.run(admin, argv));
     assertTrue(err.toString(), err.toString().contains(
         "update: Unable to parse arguments: Cannot parse order: Invalid"));
+    err.reset();
+    
+    // Check update with migration with no src and dst
+    argv = new String[] {"-update", src, "ns1", "/tmp", "-setMigration"};
+    assertEquals(-1, ToolRunner.run(admin, argv));
+    assertTrue(err.toString(), err.toString().contains(
+        "update: Unable to parse arguments: Cannot parse migration:"));
+    err.reset();
+
+    // Check update with migration with no src or dst
+    argv = new String[] {"-update", src, "ns1", "/tmp", "-setMigration", "ns1"};
+    assertEquals(-1, ToolRunner.run(admin, argv));
+    assertTrue(err.toString(), err.toString().contains(
+        "update: Unable to parse arguments: Cannot parse migration:"));
+    err.reset();
+    
+    // Check update with migration with missing dst
+    argv = new String[] {"-update", src, "ns1", "/tmp", "-setMigration", "ns2"};
+    assertEquals(-1, ToolRunner.run(admin, argv));
+    assertTrue(err.toString(), err.toString().contains(
+        "update: Unable to parse arguments: Cannot parse migration:"));
     err.reset();
   }
 

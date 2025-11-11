@@ -123,6 +123,11 @@ message RemoteLocationProto {
   optional string path = 2;
 }
 
+message MigratingMountPointProto {
+  optional string srcNs = 1;
+  optional string dstNs = 2;
+}
+
 message MountTableRecordProto {
   optional string srcPath = 1;
   repeated RemoteLocationProto destinations = 2;
@@ -146,6 +151,8 @@ message MountTableRecordProto {
   optional QuotaUsageProto quota = 13;
 
   optional bool faultTolerant = 14 [default = false];
+  
+  optional MigratingMountPointProto migratingMountPoint = 15;
 }
 
 message AddMountTableEntryRequestProto {

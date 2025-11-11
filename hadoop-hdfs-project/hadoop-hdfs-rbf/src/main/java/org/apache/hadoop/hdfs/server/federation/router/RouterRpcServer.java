@@ -44,6 +44,7 @@ import java.util.Set;
 
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.crypto.CryptoProtocolVersion;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountTableResolver;
 import org.apache.hadoop.fs.BatchedRemoteIterator.BatchedEntries;
 import org.apache.hadoop.fs.CacheFlag;
 import org.apache.hadoop.fs.CommonConfigurationKeys;
@@ -362,6 +363,12 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
     this.nnProto = new RouterNamenodeProtocol(this);
     this.clientProto = new RouterClientProtocol(conf, this);
     this.routerProto = new RouterUserProtocol(this);
+
+    if (subclusterResolver instanceof MigratingMountTableResolver) {
+      MigratingMountTableResolver migratingMountTableResolver =
+          (MigratingMountTableResolver) subclusterResolver;
+      migratingMountTableResolver.setRpcServer(this);
+    }
   }
 
   @Override
@@ -519,6 +526,23 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
       return;
     }
     checkSafeMode();
+  }
+
+  /**
+   * Set the behavior of the current operation during migration.
+   * May create directories present on the source but missing on the destination.
+   * @param migrationBehavior the behavior which determines namespace(s) to use
+   * @param path the path to which the operation will be applied
+   * @throws IOException If an error occurs
+   */
+  public void setMigrationBehavior(
+      MigratingMountTableResolver.MigrationBehavior migrationBehavior,
+      String path) throws IOException {
+    // Only set the migration behavior if migration is supported, else no-op
+    if (subclusterResolver instanceof MigratingMountTableResolver) {
+      ((MigratingMountTableResolver) subclusterResolver).setMigrationBehavior(
+          migrationBehavior, path);
+    }
   }
 
   /**
@@ -1607,6 +1631,32 @@ public class RouterRpcServer extends AbstractService implements ClientProtocol,
    */
   static void resetCurrentUser() {
     CUR_USER.set(null);
+  }
+
+  /**
+   * Override the current user for the provided operation. Unlike
+   * setCurrentUser, this automatically resets the current user to the
+   * previous user once finished, but only if a previous user was set.
+   * @param ugi UserGroupInformation to set as the current user.
+   * @param operation Runnable operation to run as the overridden user.
+   * @return The result of the operation, can be null.
+   * @throws IOException If the operation fails with an IOException.
+   */
+  public <T> T overrideUser(UserGroupInformation ugi,
+      SupplierWithIOException<T> operation) throws IOException {
+    UserGroupInformation prevUgi = CUR_USER.get();
+    try {
+      CUR_USER.set(ugi);
+      return operation.get();
+    } finally {
+      // Reset to previous user
+      CUR_USER.set(prevUgi);
+    }
+  }
+
+  @FunctionalInterface
+  public interface SupplierWithIOException<T> {
+    T get() throws IOException;
   }
 
   /**

@@ -26,11 +26,13 @@ import java.util.Map.Entry;
 import java.util.SortedMap;
 import java.util.TreeMap;
 
+import javax.annotation.Nullable;
 import org.apache.commons.lang3.builder.EqualsBuilder;
 import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
 import org.apache.hadoop.hdfs.protocol.HdfsConstants;
+import org.apache.hadoop.hdfs.server.federation.resolver.MigratingMountPointInfo;
 import org.apache.hadoop.hdfs.server.federation.resolver.RemoteLocation;
 import org.apache.hadoop.hdfs.server.federation.resolver.order.DestinationOrder;
 import org.apache.hadoop.hdfs.server.federation.router.RouterPermissionChecker;
@@ -304,6 +306,19 @@ public abstract class MountTable extends BaseRecord {
   public abstract void setQuota(RouterQuotaUsage quota);
 
   /**
+   * Get migrating mount point info. 
+   * @return MigratingMountPointInfo
+   */
+  public abstract MigratingMountPointInfo getMigratingMountPointInfo();
+
+  /**
+   * Set migrating mount point info. 
+   * @param migratingMountPointInfo The migrating mount point info.
+   */
+  public abstract void setMigratingMountPointInfo(
+      @Nullable MigratingMountPointInfo migratingMountPointInfo);
+  
+  /**
    * Get the default location.
    * @return The default location.
    */
@@ -363,6 +378,13 @@ public abstract class MountTable extends BaseRecord {
 
     if (this.getQuota() != null) {
       sb.append("[quota:").append(this.getQuota()).append("]");
+    }
+    
+    if (this.getMigratingMountPointInfo() != null) {
+      String srcNs = this.getMigratingMountPointInfo().getSrcNs();
+      String dstNs = this.getMigratingMountPointInfo().getDstNs();
+      sb.append("[migrating from ").append(srcNs).append(" to ")
+          .append(dstNs).append("]");
     }
 
     return sb.toString();
@@ -432,6 +454,7 @@ public abstract class MountTable extends BaseRecord {
         .append(this.isFaultTolerant())
         .append(this.getQuota().getQuota())
         .append(this.getQuota().getSpaceQuota())
+        .append(this.getMigratingMountPointInfo())
         .toHashCode();
   }
 
@@ -448,6 +471,8 @@ public abstract class MountTable extends BaseRecord {
           .append(this.getQuota().getQuota(), other.getQuota().getQuota())
           .append(this.getQuota().getSpaceQuota(),
               other.getQuota().getSpaceQuota())
+          .append(this.getMigratingMountPointInfo(),
+              other.getMigratingMountPointInfo())
           .isEquals();
     }
     return false;

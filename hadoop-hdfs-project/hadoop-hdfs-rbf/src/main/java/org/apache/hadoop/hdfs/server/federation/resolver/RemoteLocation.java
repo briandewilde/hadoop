@@ -17,6 +17,8 @@
  */
 package org.apache.hadoop.hdfs.server.federation.resolver;
 
+import org.apache.commons.lang3.builder.EqualsBuilder;
+import org.apache.commons.lang3.builder.HashCodeBuilder;
 import org.apache.hadoop.hdfs.server.federation.router.RemoteLocationContext;
 
 /**
@@ -97,5 +99,35 @@ public class RemoteLocation extends RemoteLocationContext {
   @Override
   public String toString() {
     return getNameserviceId() + "->" + this.dstPath;
+  }
+
+  @Override
+  public boolean equals(Object o) {
+    if (this == o) {
+      return true;
+    }
+
+    if (o == null || getClass() != o.getClass()) {
+      return false;
+    }
+
+    RemoteLocation location = (RemoteLocation) o;
+
+    return new EqualsBuilder().appendSuper(super.equals(o))
+        .append(getNameserviceId(), location.getNameserviceId())
+        .append(namenodeId, location.namenodeId)
+        .append(dstPath, location.dstPath)
+        .append(srcPath, location.srcPath)
+        .isEquals();
+  }
+
+  @Override
+  public int hashCode() {
+    return new HashCodeBuilder().appendSuper(super.hashCode())
+        .append(getNameserviceId())
+        .append(namenodeId)
+        .append(dstPath)
+        .append(srcPath)
+        .toHashCode();
   }
 }

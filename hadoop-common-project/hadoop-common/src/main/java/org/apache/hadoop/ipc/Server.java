@@ -624,6 +624,12 @@ public abstract class Server {
     processingTime -= waitTime;
     String name = call.getDetailedMetricsName();
     rpcDetailedMetrics.addProcessingTime(name, processingTime);
+    // Add metrics aliases (to support branched variants/segmentation)
+    if (call.hasDetailedMetricsAliases()) {
+      for (String metricAlias : call.getDetailedMetricsAliases()) {
+        rpcDetailedMetrics.addProcessingTime(metricAlias, processingTime);
+      }
+    }
     // Overall processing time is from arrival to completion.
     long overallProcessingTime = rpcMetrics.getMetricsTimeUnit()
         .convert(completionTimeNanos - arrivalTimeNanos, TimeUnit.NANOSECONDS);
@@ -842,6 +848,9 @@ public abstract class Server {
     // the priority level assigned by scheduler, 0 by default
     private long clientStateId;
     private boolean isCallCoordinated;
+    // Aliases for the metric, under which processing time is additionally saved
+    private Set<String> detailedMetricsAliases;
+
 
     Call() {
       this(RpcConstants.INVALID_CALL_ID, RpcConstants.INVALID_RETRY_COUNT,
@@ -893,7 +902,7 @@ public abstract class Server {
       return true;
     }
 
-    String getDetailedMetricsName() {
+    public String getDetailedMetricsName() {
       return detailedMetricsName;
     }
 
@@ -903,6 +912,48 @@ public abstract class Server {
 
     public ProcessingDetails getProcessingDetails() {
       return processingDetails;
+    }
+
+    /**
+     * Check if the call has detailed metrics aliases, for which processing time
+     * is additionally saved. This can be leveraged by a server to conditionally
+     * report a metric by different names, e.g. when different branches are
+     * taken, the metric can be reported with different names for each branch to
+     * compare performance.
+     * @return true if there are detailed metric aliases, false otherwise
+     */
+    public boolean hasDetailedMetricsAliases() {
+      return detailedMetricsAliases != null && !detailedMetricsAliases.isEmpty();
+    }
+
+    /**
+     * Add a detailed metrics alias for this call, for which processing time
+     * is additionally saved. This can be leveraged by a server to conditionally
+     * report a metric by different names, e.g. when different branches are
+     * taken, the metric can be reported with different names for each branch to
+     * compare performance.
+     * @param alias the detailed metric alias to add
+     */
+    public void addDetailedMetricsAlias(String alias) {
+      if (detailedMetricsAliases == null) {
+        detailedMetricsAliases = new HashSet<>();
+      }
+      detailedMetricsAliases.add(alias);
+    }
+
+    /**
+     * Get the detailed metrics aliases for this call, for which processing time
+     * is additionally saved. This can be leveraged by a server to conditionally
+     * report a metric by different names, e.g. when different branches are
+     * taken, the metric can be reported with different names for each branch to
+     * compare performance.
+     * @return the set of detailed metric aliases, or an empty set if none
+     */
+    Set<String> getDetailedMetricsAliases() {
+      if (detailedMetricsAliases == null) {
+        return Collections.emptySet();
+      }
+      return detailedMetricsAliases;
     }
 
     @Override
